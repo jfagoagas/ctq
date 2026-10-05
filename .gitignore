@@ -1,0 +1,18 @@
+# Binaries
+/ctq
+/dist/
+*.exe
+*.test
+
+# Test and coverage output
+coverage.out
+*.prof
+
+# watch -state files
+*.ctq-state.json
+.ctq-state-*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
