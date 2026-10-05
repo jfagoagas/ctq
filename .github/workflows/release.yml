@@ -1,0 +1,118 @@
+name: release
+
+# Pushing a v* tag scans for vulnerabilities (grype, gate), builds the binaries,
+# publishes the GitHub release, and attests every archive: SLSA build provenance
+# plus a per-platform SBOM.
+#
+# Verify a download with:
+#   gh attestation verify ctq_<version>_linux_amd64.tar.gz --repo jfagoagas/ctq
+
+on:
+  push:
+    tags: ["v*"]
+
+# No token permissions by default. Each job asks for exactly what it needs.
+permissions: {}
+
+# Never run two releases for the same tag at once.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  vulnscan:
+    # Gate: nothing is published while a fixable high or critical vulnerability
+    # is known in the Go toolchain or any module that ships in the binary.
+    name: Vulnerability scan
+    uses: $/.github/workflows/vulnscan.yml
+    permissions:
+      contents: read
+      security-events: write # grype findings to code scanning
+
+  goreleaser:
+    name: Build and publish
+    needs: vulnscan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # Sigstore keyless signing of the attestations
+      attestations: write # store the attestations on the repo
+    steps:
+      # Actions are pinned to commit SHAs. Tags can be moved; SHAs can't.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history for the changelog
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # No module cache in a release: a cache written by another workflow
+          # run could inject modules into the published binaries.
+          cache: false
+
+      # GoReleaser shells out to syft for the SBOMs.
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: v1.54.0
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # SLSA build provenance: proves each archive was built from this commit by
+      # this workflow. checksums.txt is attested too, so it can be trusted to
+      # verify the rest.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+
+  sbom-attestation:
+    name: SBOM attestation (${{ matrix.os }}/${{ matrix.arch }})
+    # attest-sbom binds one SBOM to its artifacts per call, and dependencies
+    # differ by OS, so each platform gets its own job and its own SBOM.
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # download the release assets
+      id-token: write # Sigstore keyless signing
+      attestations: write # store the attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, ext: tar.gz }
+          - { os: linux, arch: arm64, ext: tar.gz }
+          - { os: darwin, arch: amd64, ext: tar.gz }
+          - { os: darwin, arch: arm64, ext: tar.gz }
+          - { os: windows, arch: amd64, ext: zip }
+          - { os: windows, arch: arm64, ext: zip }
+    steps:
+      # Download from the published release instead of passing workflow
+      # artifacts: what gets attested is exactly what users download.
+      - name: Download archive and SBOM
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="ctq_${version}_${OS}_${ARCH}.${EXT}"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive" --pattern "$archive.sbom.json"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sbom=$archive.sbom.json" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: ${{ steps.files.outputs.archive }}
+          sbom-path: ${{ steps.files.outputs.sbom }}

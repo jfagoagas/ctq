@@ -10,11 +10,29 @@ The same engine is available as plain CLI commands for scripts and pipes.
 
 ## Install
 
-Requires Go 1.26 or later.
+Download a binary for Linux, macOS or Windows (amd64 and arm64) from the [releases page](https://github.com/jfagoagas/ctq/releases), or install with Go 1.21 or later:
 
 ```sh
 go install github.com/jfagoagas/ctq@latest
 ```
+
+ctq needs Go 1.26 to build. Older Go versions (1.21+) download that toolchain automatically and print a "switching" message.
+
+### Verify a release
+
+Every archive in a release has a signed [SLSA build provenance](https://slsa.dev/) attestation and an SPDX SBOM attestation, both created by the release workflow. To check that a download was built from this repository by that workflow:
+
+```sh
+gh attestation verify ctq_<version>_linux_amd64.tar.gz --repo jfagoagas/ctq
+```
+
+Add `--predicate-type https://spdx.dev/Document/v2.3` to verify the SBOM attestation instead. The SBOM itself is attached to the release next to each archive (`*.sbom.json`), so you can scan a release for known vulnerabilities without running it:
+
+```sh
+grype sbom:ctq_<version>_linux_amd64.tar.gz.sbom.json
+```
+
+Releases are gated on the same scan: nothing is published while a fixable high or critical vulnerability is known in the Go toolchain or a dependency. The latest release's SBOMs are rescanned every week.
 
 Or from source:
 
@@ -182,6 +200,18 @@ CTQ_LIVE=1 go test -run TestLive -v ./internal/ct/   # checks parsing against re
 ```
 
 Unit tests use local HTTP servers and fakes; nothing touches the network unless `CTQ_LIVE` is set.
+
+CI also validates the release config, audits the workflows with [zizmor](https://docs.zizmor.sh/), and scans each platform's binary with [syft](https://github.com/anchore/syft) and [grype](https://github.com/anchore/grype). To run the same checks locally:
+
+```sh
+goreleaser check
+zizmor --persona auditor .github/
+grype dir:.   # dependencies only; CI scans the built binary, which adds the Go stdlib
+```
+
+To accept a grype finding that doesn't apply to ctq, add it to `.grype.yaml` with a reason.
+
+Releases are cut by pushing a `v*` tag; `.github/workflows/release.yml` does the rest.
 
 ## License
 

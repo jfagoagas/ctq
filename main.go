@@ -32,6 +32,7 @@ Usage:
   ctq search [flags] <domain>   certificates already logged (crt.sh, Cert Spotter)
   ctq watch  [flags] <domain>   new certificates, tailed directly from all CT logs
   ctq tui    [flags] [domain]   interactive: history, live feed and subdomain inventory
+  ctq version                   print the version
 
 Run "ctq <command> -h" for flags.
 `
@@ -43,6 +44,7 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ct.UserAgent = "ctq/" + buildVersion()
 
 	var err error
 	switch os.Args[1] {
@@ -54,6 +56,9 @@ func main() {
 		err = runTUI(ctx, os.Args[2:], os.Stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(os.Stdout, usage)
+		return
+	case "version", "-version", "--version":
+		fmt.Println(versionString())
 		return
 	default:
 		fmt.Fprintf(os.Stderr, "ctq: unknown command %q\n\n%s", os.Args[1], usage)

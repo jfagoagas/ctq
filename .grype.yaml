@@ -1,0 +1,11 @@
+# Grype configuration, picked up automatically by grype and the vulnscan workflow.
+#
+# To accept a finding that doesn't apply (for example, a vulnerable function ctq
+# never calls), add it below with the reason. Every ignore needs a reason and a
+# date, so it can be revisited.
+#
+# ignore:
+#   - vulnerability: GO-2026-0000
+#     reason: "ctq never calls the affected function (x.Y). Reviewed 2026-10-05."
+
+ignore: []

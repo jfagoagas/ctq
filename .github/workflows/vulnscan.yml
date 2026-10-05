@@ -1,0 +1,154 @@
+name: vulnscan
+
+# syft inventories what's in the binary (Go stdlib version + every module from
+# the embedded build info); grype matches that SBOM against vulnerability data.
+#
+# - Called from ci.yml (every push and PR) and release.yml (gate before
+#   publishing): build the binary, generate the SBOM, fail on fixable high or
+#   critical vulnerabilities.
+# - Weekly schedule: rescan the SBOMs attached to the latest release, to catch
+#   vulnerabilities disclosed after it shipped. A failure here means "cut a
+#   patch release", and GitHub emails the failure.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+
+permissions: {}
+
+# In a called workflow github.workflow is the caller's name, so CI and the
+# release gate get separate groups. Never cancel: a cancelled gate fails the release.
+concurrency:
+  group: vulnscan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan-build:
+    name: Grype (${{ matrix.goos }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload findings to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        # Dependencies differ by OS (Bubble Tea has a Windows-only console
+        # package), so scan each. arm64 has the same modules as amd64.
+        goos: [linux, darwin, windows]
+    steps:
+      # Actions are pinned to commit SHAs. Tags can be moved; SHAs can't.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod # uses the toolchain directive: the Go that ships
+          cache: false # this also gates releases; no cache from other runs
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o "ctq-$GOOS" .
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+        with:
+          syft-version: v1.54.0
+
+      - name: Generate SBOM
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          GOOS: ${{ matrix.goos }}
+        # Same format as the release SBOMs, so results are comparable.
+        run: '"$SYFT" "ctq-$GOOS" --output "spdx-json@2.3=sbom-$GOOS.json"'
+
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        id: grype
+        with:
+          sbom: sbom-${{ matrix.goos }}.json
+          grype-version: v0.120.0
+          # Gate on what you can act on: high or critical with a fix available.
+          # Everything else still shows up in code scanning as a warning.
+          severity-cutoff: high
+          only-fixed: true
+          fail-build: true
+          output-format: sarif
+          # Don't restore the vulnerability DB from the actions cache: a
+          # tampered cache could hide findings from a release gate.
+          cache-db: false
+
+      - name: Upload to code scanning
+        # Run even when grype fails the build, so the findings are visible.
+        # Fork PRs get a read-only token and can't upload; skip them.
+        if: >-
+          !cancelled() && steps.grype.outputs.sarif != '' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: grype-${{ matrix.goos }}
+
+  scan-release:
+    name: Grype (latest release SBOMs)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # download release assets
+    steps:
+      - name: Download release SBOMs
+        id: sboms
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null); then
+            echo "::notice::No release yet, nothing to scan."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.sbom.json' --dir sboms
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        if: steps.sboms.outputs.found == 'true'
+        id: grype
+        with:
+          grype-version: v0.120.0
+          cache-db: false
+
+      - name: Scan each SBOM
+        if: steps.sboms.outputs.found == 'true'
+        env:
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+          TAG: ${{ steps.sboms.outputs.tag }}
+        run: |
+          status=0
+          {
+            echo "## Grype: $TAG"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for sbom in sboms/*.sbom.json; do
+            name=$(basename "$sbom" .sbom.json)
+            echo "::group::$name"
+            # Table to the log and the job summary; a non-zero exit means a
+            # fixable high/critical vulnerability shipped in this release.
+            if ! "$GRYPE" "sbom:$sbom" --only-fixed --fail-on high --output table > report.txt; then
+              status=1
+            fi
+            cat report.txt
+            echo "::endgroup::"
+            {
+              echo "### $name"
+              echo '```'
+              cat report.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"

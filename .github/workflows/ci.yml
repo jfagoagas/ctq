@@ -5,13 +5,19 @@ on:
     branches: [main]
   pull_request:
 
-# Read-only token: CI never needs to write to the repo.
-permissions:
-  contents: read
+# No token permissions by default. Each job asks for exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # Actions are pinned to commit SHAs. Tags can be moved; SHAs can't.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,3 +30,43 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race ./...
+
+  goreleaser-check:
+    name: GoReleaser config
+    # Catches a broken .goreleaser.yaml on the PR, not when a tag is pushed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: check
+
+  vulnscan:
+    name: Vulnerability scan
+    uses: $/.github/workflows/vulnscan.yml
+    permissions:
+      contents: read
+      security-events: write # grype findings to code scanning
+
+  zizmor:
+    name: Workflow security (zizmor)
+    # Static analysis of the workflows themselves: injection, over-broad
+    # permissions, unpinned actions, credential leaks, cache poisoning.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload findings to code scanning (Security tab)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: 1.30.1 # pinned: new rules shouldn't fail CI without a code change
+          persona: auditor

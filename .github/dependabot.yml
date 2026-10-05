@@ -1,0 +1,25 @@
+# Keeps the SHA-pinned actions and Go modules current. Pinning by SHA without
+# updates means quietly missing security fixes.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait before proposing a new release: compromised versions are usually
+    # caught and pulled within days.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      charm:
+        patterns: ["charm.land/*", "github.com/charmbracelet/*"]

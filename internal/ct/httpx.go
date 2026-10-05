@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-const userAgent = "ctq/0.1"
+// UserAgent is sent with every request. main sets it to the release version.
+var UserAgent = "ctq/dev"
 
 // HTTPError is a non-2xx response.
 type HTTPError struct {
@@ -64,7 +65,7 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("User-Agent", UserAgent)
 		for k, v := range header {
 			req.Header.Set(k, v)
 		}
