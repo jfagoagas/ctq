@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
@@ -522,6 +523,121 @@ func TestEmptyStates(t *testing.T) {
 	typeText(m, "zzz")
 	if !strings.Contains(m.render(), `Nothing matches "zzz"`) {
 		t.Error("a filter with no matches should say so")
+	}
+}
+
+// TestLayoutFitsTerminal checks the box geometry in every state: the frame must
+// fill the terminal height exactly and never exceed its width, or the alt screen
+// scrolls and the boxes tear.
+func TestLayoutFitsTerminal(t *testing.T) {
+	states := map[string]func(m *Model){
+		"plain":   func(m *Model) {},
+		"details": func(m *Model) { m.Update(key("enter")) },
+		"filter":  func(m *Model) { m.Update(key("/")); typeText(m, "api") },
+		"prompt":  func(m *Model) { m.Update(key("d")) },
+		"prompt+details+filter": func(m *Model) {
+			m.Update(key("enter"))
+			m.Update(key("/"))
+			typeText(m, "a")
+			m.Update(key("enter"))
+			m.Update(key("d"))
+		},
+		"empty live tab": func(m *Model) { m.Update(key("2")) },
+		"names":          func(m *Model) { m.Update(key("3")) },
+		"logs":           func(m *Model) { m.Update(key("4")) },
+	}
+	for _, size := range [][2]int{{140, 40}, {100, 30}, {80, 24}} {
+		for name, setup := range states {
+			m := newTestModel(t)
+			m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+			loadHistory(m, cert("1", "C=US, O=Let's Encrypt, CN=R12", now, "api.example.com", "www.example.com"))
+			setup(m)
+
+			lines := strings.Split(m.render(), "\n")
+			if len(lines) != size[1] {
+				t.Errorf("%dx%d %s: %d lines, want %d", size[0], size[1], name, len(lines), size[1])
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w > size[0] {
+					t.Errorf("%dx%d %s: line %d is %d wide", size[0], size[1], name, i, w)
+				}
+			}
+			plain := ansi.Strip(m.render())
+			if strings.Count(plain, "╭") != strings.Count(plain, "╯") {
+				t.Errorf("%dx%d %s: unbalanced box corners", size[0], size[1], name)
+			}
+			// The box truncates overflow, which would hide a table wider than its box.
+			tw := 0
+			for _, c := range m.table.Columns() {
+				tw += c.Width + 2
+			}
+			if tw > m.innerWidth() {
+				t.Errorf("%dx%d %s: table is %d wide, box interior is %d", size[0], size[1], name, tw, m.innerWidth())
+			}
+		}
+	}
+}
+
+func TestFitColumns(t *testing.T) {
+	specs := []colSpec{
+		{title: "A", width: 10}, {title: "B", width: 18, drop: 2}, {title: "C", width: 11, drop: 3},
+		{title: "NAME", width: 30, shrink: true}, {title: "FLEX", flex: true},
+	}
+	titles := func(cols []table.Column) string {
+		var s []string
+		for _, c := range cols {
+			s = append(s, c.Title)
+		}
+		return strings.Join(s, ",")
+	}
+	width := func(cols []table.Column) int {
+		w := 0
+		for _, c := range cols {
+			w += c.Width + 2
+		}
+		return w
+	}
+
+	// Wide: everything fits, FLEX takes the rest exactly.
+	cols, keep := fitColumns(specs, 120)
+	if titles(cols) != "A,B,C,NAME,FLEX" || width(cols) != 120 || len(keep) != 5 {
+		t.Errorf("wide: %s width %d", titles(cols), width(cols))
+	}
+	// Narrower: C (drop 3) goes first, then B.
+	cols, keep = fitColumns(specs, 90)
+	if titles(cols) != "A,B,NAME,FLEX" || keep[2] != 3 || width(cols) != 90 {
+		t.Errorf("90: %s width %d keep %v", titles(cols), width(cols), keep)
+	}
+	cols, _ = fitColumns(specs, 75)
+	if titles(cols) != "A,NAME,FLEX" || width(cols) != 75 {
+		t.Errorf("75: %s width %d", titles(cols), width(cols))
+	}
+	// Nothing left to drop: NAME shrinks so FLEX keeps its minimum.
+	cols, _ = fitColumns(specs, 60)
+	if titles(cols) != "A,NAME,FLEX" || cols[2].Width != minFlex || width(cols) != 60 {
+		t.Errorf("60: %+v width %d", cols, width(cols))
+	}
+	if specs[3].width != 30 {
+		t.Error("fitColumns must not modify the caller's specs")
+	}
+}
+
+func TestBoxTitleInBorder(t *testing.T) {
+	out := ansi.Strip(box("Title", "3/9", "body", 30, 4, true))
+	lines := strings.Split(out, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("%d lines", len(lines))
+	}
+	if !strings.HasPrefix(lines[0], "╭─Title") || !strings.HasSuffix(lines[0], " 3/9 ─╮") {
+		t.Errorf("top border = %q", lines[0])
+	}
+	if lines[1] != "│ body"+strings.Repeat(" ", 22)+" │" {
+		t.Errorf("body line = %q", lines[1])
+	}
+	for i, l := range lines {
+		if ansi.StringWidth(l) != 30 {
+			t.Errorf("line %d is %d wide: %q", i, ansi.StringWidth(l), l)
+		}
 	}
 }
 

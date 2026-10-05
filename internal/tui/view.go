@@ -29,7 +29,6 @@ var (
 	styleErr       = lipgloss.NewStyle().Foreground(colorErr)
 	styleLive      = lipgloss.NewStyle().Foreground(colorLive)
 	styleNew       = lipgloss.NewStyle().Foreground(colorNew).Bold(true)
-	styleDetail    = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderTop(true).BorderForeground(colorDim).Padding(0, 1)
 	styleLabel     = lipgloss.NewStyle().Foreground(colorDim).Width(10)
 	styleEmpty     = lipgloss.NewStyle().Foreground(colorDim).Padding(1, 2)
 )
@@ -58,33 +57,44 @@ func (m *Model) render() string {
 	if m.width == 0 {
 		return "starting…"
 	}
-	parts := []string{m.headerView(), m.tabsView(), m.bodyView()}
+	w := m.boxWidth()
+	parts := []string{"", m.headerView(), ""}
+	// Whichever input has focus gets the accent border; the main box dims meanwhile.
+	parts = append(parts, box(m.tabsTitle(), m.tabsRight(), m.mainBody(), w, m.mainBoxHeight, !m.editingDomain))
 	if m.detail {
-		parts = append(parts, m.detailView())
-	}
-	if m.filtering || m.filter.Value() != "" {
-		parts = append(parts, m.filter.View())
+		parts = append(parts, box(boxTitle("Details", colorDim), "", m.detailBody(), w, detailBoxHeight, false))
 	}
 	if m.editingDomain {
 		line := m.domainInput.View()
 		if m.domainErr != "" {
 			line += styleErr.Render("  " + m.domainErr)
 		}
-		parts = append(parts, truncate(line, m.width))
+		parts = append(parts, box(boxTitle("Search a domain", colorAccent), "", line, w, promptBoxHeight, true))
 	}
 	parts = append(parts, m.statusView(), m.helpView())
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	// Indent every line by the margin: boxes, header and status alike.
+	margin := strings.Repeat(" ", marginX)
+	out := strings.Split(lipgloss.JoinVertical(lipgloss.Left, parts...), "\n")
+	for i, l := range out {
+		if l != "" {
+			out[i] = margin + l
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
-// bodyView is the table, or an explanation when it has no rows. An empty table
-// can't tell "still loading" from "nothing found" from "filtered out".
-func (m *Model) bodyView() string {
-	if len(m.rows) > 0 {
-		return m.table.View()
+// mainBody is the table (or an empty-state message) plus the filter line when active.
+func (m *Model) mainBody() string {
+	body := m.table.View()
+	if len(m.rows) == 0 {
+		// An empty table can't tell "still loading" from "nothing found" from "filtered out".
+		body = lipgloss.NewStyle().Height(m.table.Height() + 2).Render(styleEmpty.Render(m.emptyMessage()))
 	}
-	height := m.table.Height() + 2 // viewport + header row and its border
-	return lipgloss.NewStyle().Height(height).MaxHeight(height).Width(m.width).
-		Render(styleEmpty.Render(m.emptyMessage()))
+	if m.filterShown() {
+		body += "\n" + m.filter.View()
+	}
+	return body
 }
 
 func (m *Model) emptyMessage() string {
@@ -137,10 +147,11 @@ func (m *Model) headerView() string {
 	if m.source == "auto" && len(m.history) > 0 && !m.searching {
 		right += styleDim.Render(" → ") + m.history[0].Source
 	}
-	return spread(m.width, left, right)
+	return spread(m.boxWidth(), left, right)
 }
 
-func (m *Model) tabsView() string {
+// tabsTitle is the tab bar, drawn inside the main box's top border.
+func (m *Model) tabsTitle() string {
 	live := fmt.Sprintf("2 Live %d", len(m.live))
 	if m.unseen > 0 {
 		live += styleLive.Render(fmt.Sprintf(" +%d", m.unseen))
@@ -160,7 +171,11 @@ func (m *Model) tabsView() string {
 			out[i] = styleTab.Render(l)
 		}
 	}
+	return strings.Join(out, " ")
+}
 
+// tabsRight is the main box's top-right corner: sort order and row position.
+func (m *Model) tabsRight() string {
 	var right []string
 	if m.tab == tabNames {
 		right = append(right, styleDim.Render("sort: ")+m.sort.String())
@@ -168,8 +183,14 @@ func (m *Model) tabsView() string {
 	if n := len(m.rows); n > 0 {
 		right = append(right, styleDim.Render(fmt.Sprintf("%d/%d", m.table.Cursor()+1, n)))
 	}
-	return spread(m.width, lipgloss.JoinHorizontal(lipgloss.Top, out...), strings.Join(right, styleDim.Render(" · ")))
+	return strings.Join(right, styleDim.Render(" · "))
 }
+
+// lineWidth is the width of the lines below the boxes. They're inset like box
+// content so their text lines up with the table's first column.
+func (m *Model) lineWidth() int { return m.boxWidth() - 2*boxPad }
+
+func inset(s string) string { return strings.Repeat(" ", boxPad) + s }
 
 func (m *Model) statusView() string {
 	var left string
@@ -190,7 +211,8 @@ func (m *Model) statusView() string {
 	}
 
 	right := m.liveStatus()
-	return spread(m.width, truncate(left, m.width-lipgloss.Width(right)-2), right)
+	w := m.lineWidth()
+	return inset(spread(w, truncate(left, w-lipgloss.Width(right)-2), right))
 }
 
 func (m *Model) liveStatus() string {
@@ -227,18 +249,13 @@ func (m *Model) helpView() string {
 	case m.tab == tabNames:
 		keys = "o sort · " + keys
 	}
-	return styleDim.Render(truncate(keys, m.width))
+	return inset(styleDim.Render(truncate(keys, m.lineWidth())))
 }
 
-func (m *Model) detailView() string {
+// detailBody is the details box content. The box pads and truncates it.
+func (m *Model) detailBody() string {
 	lines := m.detailLines()
-	for len(lines) < detailHeight-1 {
-		lines = append(lines, "")
-	}
-	for i, l := range lines[:detailHeight-1] {
-		lines[i] = truncate(l, m.width-2)
-	}
-	return styleDetail.Width(m.width).Render(strings.Join(lines[:detailHeight-1], "\n"))
+	return strings.Join(lines[:min(len(lines), detailLines)], "\n")
 }
 
 func (m *Model) detailLines() []string {
@@ -286,7 +303,7 @@ func (m *Model) detailLines() []string {
 		first := s.firstSeen.Format("2006-01-02") + "  " + ago(m.now().Sub(s.firstSeen))
 		return []string{
 			field("name", n),
-			field("seen", fmt.Sprintf("%d certificates", s.seen)),
+			field("seen", plural(s.seen, "certificate")),
 			field("first", first),
 			field("expires", s.lastExpiry.Format("2006-01-02")+"  (latest expiry across all certs)"),
 			field("issuers", strings.Join(sortedKeys(s.issuers), ", ")),
@@ -331,6 +348,9 @@ func (m *Model) validity(c ct.Certificate) string {
 }
 
 func ago(d time.Duration) string {
+	if d < 0 {
+		return "in the future (" + strings.TrimSuffix(ago(-d), " ago") + " from now)"
+	}
 	switch {
 	case d < time.Minute:
 		return fmt.Sprintf("%ds ago", int(d.Seconds()))
@@ -340,6 +360,13 @@ func ago(d time.Duration) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	}
 	return fmt.Sprintf("%d days ago", int(d.Hours()/24))
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 // spread puts left and right on one line, right-aligned.

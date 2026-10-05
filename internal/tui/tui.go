@@ -71,7 +71,6 @@ func (s sortMode) String() string {
 }
 
 const (
-	detailHeight   = 7 // top border + 6 content lines
 	newWindow      = 7 * 24 * time.Hour
 	expiringWindow = 14 * 24 * time.Hour
 )
@@ -124,6 +123,9 @@ type Model struct {
 	spinner   spinner.Model
 	width     int
 	height    int
+
+	mainBoxHeight int   // outer height of the main box, set by layout
+	keep          []int // indexes of the row cells whose columns fit the width
 
 	history  []ct.Certificate
 	live     []ct.Match // append order; shown newest first
@@ -555,7 +557,8 @@ func (m *Model) nameTags(s *nameStat) []string {
 	if s.live {
 		tags = append(tags, styleLive.Render("live"))
 	}
-	if now.Sub(s.firstSeen) <= newWindow {
+	// Future-dated certificates exist (NotBefore ahead of issuance); they aren't "new".
+	if age := now.Sub(s.firstSeen); age >= 0 && age <= newWindow {
 		tags = append(tags, styleNew.Render("new"))
 	}
 	switch {
@@ -662,100 +665,183 @@ func (m *Model) refresh() {
 	}
 
 	m.rows = rows
+	cols, keep := fitColumns(m.columnSpecs(), m.innerWidth())
+	m.keep = keep
 	// Rows must never be wider than the columns, or the table panics while rendering.
 	m.table.SetRows(nil)
-	m.table.SetColumns(m.columns())
+	m.table.SetColumns(cols)
 	m.applyRows()
 }
 
-// applyRows hands the rows to the table with the selected row's colors stripped.
-// A colored cell ends in an SGR reset, which would also clear the selection
-// background and leave holes in the highlight.
+// applyRows hands the rows to the table, keeping only the columns that fit and
+// stripping the selected row's colors. A colored cell ends in an SGR reset, which
+// would also clear the selection background and leave holes in the highlight.
 func (m *Model) applyRows() {
-	m.table.SetRows(m.rows) // clamps the cursor to the new length
-	if m.table.Cursor() < 0 && len(m.rows) > 0 {
+	rows := make([]table.Row, len(m.rows))
+	for i, r := range m.rows {
+		p := make(table.Row, len(m.keep))
+		for j, k := range m.keep {
+			p[j] = r[k]
+		}
+		rows[i] = p
+	}
+	m.table.SetRows(rows) // clamps the cursor to the new length
+	if m.table.Cursor() < 0 && len(rows) > 0 {
 		m.table.SetCursor(0) // SetRows leaves the cursor at -1 after an empty table
 	}
-	cur := m.table.Cursor()
-	if cur < 0 || cur >= len(m.rows) {
-		return
+	if cur := m.table.Cursor(); cur >= 0 && cur < len(rows) {
+		for j, cell := range rows[cur] {
+			rows[cur][j] = ansi.Strip(cell)
+		}
+		m.table.SetRows(rows)
 	}
-	rows := slices.Clone(m.rows)
-	plain := make(table.Row, len(rows[cur]))
-	for i, cell := range rows[cur] {
-		plain[i] = ansi.Strip(cell)
-	}
-	rows[cur] = plain
-	m.table.SetRows(rows)
 }
 
-func (m *Model) columns() []table.Column {
+// colSpec describes one column. Exactly one column per table is flex: it takes
+// whatever width is left. When that falls under minFlex, columns are dropped
+// (highest drop first), then shrink columns give up width.
+type colSpec struct {
+	title  string
+	width  int
+	flex   bool
+	drop   int  // 0 = always shown; higher = dropped earlier on narrow terminals
+	shrink bool // may be narrowed (and truncated) as a last resort
+}
+
+const (
+	minFlex      = 20 // narrowest useful flex column
+	minShrinkCol = 12
+)
+
+func (m *Model) columnSpecs() []colSpec {
 	switch m.tab {
 	case tabHistory:
-		return withFlex(m.width, "NAMES", []table.Column{
-			{Title: "NOT BEFORE", Width: 10}, {Title: "NOT AFTER", Width: 10}, {Title: "STATUS", Width: 8},
-			{Title: "ISSUER", Width: 18}, {Title: "SOURCE", Width: 11},
-		})
+		return []colSpec{
+			{title: "NOT BEFORE", width: 10}, {title: "NOT AFTER", width: 10, drop: 1}, {title: "STATUS", width: 8},
+			{title: "ISSUER", width: 18, drop: 2}, {title: "SOURCE", width: 11, drop: 3}, {title: "NAMES", flex: true},
+		}
 	case tabLive:
-		return withFlex(m.width, "NAMES", []table.Column{
-			{Title: "NOT BEFORE", Width: 11}, {Title: "TYPE", Width: 7}, {Title: "ISSUER", Width: 18}, {Title: "LOG", Width: 30},
-		})
+		return []colSpec{
+			{title: "NOT BEFORE", width: 11}, {title: "TYPE", width: 7, drop: 2}, {title: "ISSUER", width: 18, drop: 1},
+			{title: "LOG", width: 30, drop: 3}, {title: "NAMES", flex: true},
+		}
 	case tabNames:
-		// Size NAME to its content. Stretching it to the full width puts the
+		// NAME is sized to its content. Stretching it to the full width puts the
 		// other columns a screen away from the name they describe.
-		longest := 0
+		longest := len("NAME")
 		for _, r := range m.rows {
 			longest = max(longest, len(r[0]))
 		}
-		rest := []table.Column{
-			{Title: "STATUS", Width: 17}, {Title: "SEEN", Width: 4},
-			{Title: "FIRST CERT", Width: 10}, {Title: "EXPIRES", Width: 10},
+		return []colSpec{
+			{title: "NAME", width: longest, shrink: true}, {title: "STATUS", width: 17},
+			{title: "SEEN", width: 4, drop: 3}, {title: "FIRST CERT", width: 10, drop: 2},
+			{title: "EXPIRES", width: 10}, {title: "ISSUERS", flex: true, drop: 1},
 		}
-		const minIssuers = 16
-		maxName := flexWidth(m.width, rest) - minIssuers - 2
-		name := table.Column{Title: "NAME", Width: max(min(longest, maxName), 20)}
-		return withFlex(m.width, "ISSUERS", append([]table.Column{name}, rest...))
 	case tabLogs:
-		return withFlex(m.width, "LAST ERROR", []table.Column{
-			{Title: "OPERATOR", Width: 14}, {Title: "LOG", Width: 30}, {Title: "TYPE", Width: 5},
-			{Title: "POSITION", Width: 8}, {Title: "LAG", Width: 6}, {Title: "STATUS", Width: 11},
-		})
+		return []colSpec{
+			{title: "OPERATOR", width: 14, drop: 2}, {title: "LOG", width: 30, shrink: true}, {title: "TYPE", width: 5, drop: 3},
+			{title: "POSITION", width: 8, drop: 1}, {title: "LAG", width: 6}, {title: "STATUS", width: 11},
+			{title: "LAST ERROR", flex: true},
+		}
 	}
 	return nil
 }
 
-func withFlex(total int, title string, fixed []table.Column) []table.Column {
-	return append(fixed, table.Column{Title: title, Width: flexWidth(total, fixed)})
-}
-
-// flexWidth gives the remaining width to one column. Each cell has 1 column of padding on each side.
-func flexWidth(total int, fixed []table.Column) int {
-	used := 2 * (len(fixed) + 1)
-	for _, c := range fixed {
-		used += c.Width
+// fitColumns picks the columns that fit in width and sizes them. keep holds the
+// indexes of the kept specs, so rows (built with every column) can be projected.
+// Each cell has 1 column of padding on each side.
+func fitColumns(specs []colSpec, width int) (cols []table.Column, keep []int) {
+	specs = slices.Clone(specs)
+	for i := range specs {
+		keep = append(keep, i)
 	}
-	return max(total-used, 20)
+	hasFlex := func() bool {
+		for _, k := range keep {
+			if specs[k].flex {
+				return true
+			}
+		}
+		return false
+	}
+	spare := func() int {
+		used := 2 * len(keep)
+		for _, k := range keep {
+			if !specs[k].flex {
+				used += specs[k].width
+			}
+		}
+		return width - used
+	}
+	need := func() int {
+		if hasFlex() {
+			return minFlex
+		}
+		return 0
+	}
+
+	for spare() < need() {
+		victim := -1
+		for i, k := range keep {
+			if specs[k].drop > 0 && (victim < 0 || specs[k].drop > specs[keep[victim]].drop) {
+				victim = i
+			}
+		}
+		if victim < 0 {
+			break
+		}
+		keep = slices.Delete(keep, victim, victim+1)
+	}
+	// Still too wide: narrow the shrink columns, truncating their content.
+	for _, k := range keep {
+		if short := need() - spare(); short > 0 && specs[k].shrink {
+			specs[k].width = max(specs[k].width-short, minShrinkCol)
+		}
+	}
+	// A dropped flex column leaves spare width; give it to a shrink column.
+	if !hasFlex() {
+		for _, k := range keep {
+			if specs[k].shrink && spare() > 0 {
+				specs[k].width += spare()
+			}
+		}
+	}
+
+	for _, k := range keep {
+		w := specs[k].width
+		if specs[k].flex {
+			w = max(spare(), 1)
+		}
+		cols = append(cols, table.Column{Title: specs[k].title, Width: w})
+	}
+	return cols, keep
 }
 
 func (m *Model) layout() {
 	if m.width == 0 {
 		return
 	}
-	h := m.height - 4 // header, tabs, status, help
+	// Everything not taken by chrome and the optional boxes goes to the main box.
+	main := m.height - chromeRows
 	if m.detail {
-		h -= detailHeight
-	}
-	if m.filtering || m.filter.Value() != "" {
-		h--
+		main -= detailBoxHeight
 	}
 	if m.editingDomain {
-		h--
+		main -= promptBoxHeight
 	}
-	m.filter.SetWidth(m.width - 4)
+	m.mainBoxHeight = max(main, 7)
+
+	body := m.mainBoxHeight - 2 // borders
+	if m.filterShown() {
+		body-- // the filter line sits at the bottom of the main box
+	}
+	iw := m.innerWidth()
+	m.filter.SetWidth(iw - 4)
 	// textinput pads to its full Width. Keep it short so a validation error fits beside it;
 	// longer input scrolls horizontally.
-	m.domainInput.SetWidth(max(min(m.width-50, 40), 10))
-	m.table.SetWidth(m.width)
-	m.table.SetHeight(max(h, 4))
+	m.domainInput.SetWidth(max(min(iw-50, 40), 10))
+	m.table.SetWidth(iw)
+	m.table.SetHeight(max(body, 4))
 	m.refresh()
 }
+
+func (m *Model) filterShown() bool { return m.filtering || m.filter.Value() != "" }
