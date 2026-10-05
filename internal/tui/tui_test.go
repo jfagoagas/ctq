@@ -641,6 +641,88 @@ func TestBoxTitleInBorder(t *testing.T) {
 	}
 }
 
+func selectedName(m *Model) string {
+	return ansi.Strip(m.table.Rows()[m.table.Cursor()][0])
+}
+
+func TestEnterKeepsSelection(t *testing.T) {
+	m := newTestModel(t)
+	loadHistory(m,
+		cert("1", "CN=R12", now, "a.example.com"),
+		cert("2", "CN=R12", now, "b.example.com"),
+		cert("3", "CN=R12", now, "c.example.com"),
+	)
+	m.Update(key("3"))
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(key("enter"))
+	if m.table.Cursor() != 2 || selectedName(m) != "c.example.com" {
+		t.Fatalf("opening details moved the cursor to %d (%s)", m.table.Cursor(), selectedName(m))
+	}
+	if !strings.Contains(m.render(), "c.example.com") {
+		t.Error("details should describe the selected row")
+	}
+	m.Update(key("enter"))
+	if m.table.Cursor() != 2 {
+		t.Fatalf("closing details moved the cursor to %d", m.table.Cursor())
+	}
+}
+
+func TestSelectionFollowsItemWhenRowsShift(t *testing.T) {
+	m := newTestModel(t)
+	match := func(log string, idx uint64, name string) matchMsg {
+		return matchMsg{gen: m.watchGen, match: ct.Match{Log: log, Index: idx, Certificate: cert(name, "CN=R12", now, name)}}
+	}
+	m.Update(key("2"))
+	m.Update(match("Argon", 1, "a.example.com"))
+	m.Update(match("Argon", 2, "b.example.com"))
+	// Newest first: b, a. Select a (row 1).
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if got := ansi.Strip(m.table.Rows()[m.table.Cursor()][4]); got != "a.example.com" {
+		t.Fatalf("setup: selected %q", got)
+	}
+	// A new match is prepended. The selection must stay on a, now row 2.
+	m.Update(match("Argon", 3, "c.example.com"))
+	if got := ansi.Strip(m.table.Rows()[m.table.Cursor()][4]); got != "a.example.com" || m.table.Cursor() != 2 {
+		t.Fatalf("a new live match moved the selection to row %d (%s)", m.table.Cursor(), got)
+	}
+}
+
+func TestLogsTickKeepsSelection(t *testing.T) {
+	m := newTestModel(t)
+	m.Update(key("w"))
+	for _, n := range []string{"a", "b", "c"} {
+		m.sink.progress(ct.Log{Name: n, Operator: "Op", URL: n}, 10, 10)
+	}
+	m.Update(key("4"))
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	m.Update(tickMsg(now))
+	m.Update(tickMsg(now))
+	if m.table.Cursor() != 1 {
+		t.Fatalf("the per-second tick moved the cursor to %d", m.table.Cursor())
+	}
+}
+
+func TestFilterKeepsSelectedItemOrClamps(t *testing.T) {
+	m := newTestModel(t)
+	loadHistory(m,
+		cert("1", "CN=R12", now, "api.example.com"),
+		cert("2", "CN=R12", now, "app.example.com"),
+		cert("3", "CN=R12", now, "www.example.com"),
+	)
+	m.Update(key("3"))
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // app
+	m.Update(key("/"))
+	typeText(m, "ap") // api, app: app stays selected at row 1
+	if selectedName(m) != "app.example.com" {
+		t.Fatalf("filter lost the selected item: %s", selectedName(m))
+	}
+	typeText(m, "i") // only api remains
+	if m.table.Cursor() != 0 || selectedName(m) != "api.example.com" {
+		t.Fatalf("cursor should clamp to the remaining row, got %d", m.table.Cursor())
+	}
+}
+
 func TestHeaderShowsActualSource(t *testing.T) {
 	m := newTestModel(t)
 	c := cert("1", "CN=R12", now, "api.example.com")

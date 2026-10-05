@@ -117,6 +117,7 @@ type Model struct {
 	sort      sortMode
 	table     table.Model
 	rows      []table.Row // styled rows; the selected one is shown unstyled
+	rowKeys   []string    // stable identity per row, so the selection survives refreshes
 	filter    textinput.Model
 	filtering bool
 	detail    bool
@@ -597,10 +598,22 @@ func sortedKeys(set map[string]struct{}) []string {
 }
 
 // refresh recomputes the visible rows for the current tab and filter.
+//
+// The selection survives it: refresh runs on layout changes (details pane),
+// filter keystrokes, live matches and the Logs tab's 1s tick, and rows can move
+// (Live is newest first). So the cursor follows the selected item's key, and
+// only falls back to its old position when that item is gone.
 func (m *Model) refresh() {
+	prevCur := m.table.Cursor()
+	prevKey := ""
+	if prevCur >= 0 && prevCur < len(m.rowKeys) {
+		prevKey = m.rowKeys[prevCur]
+	}
+
 	needle := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	m.visible = m.visible[:0]
 	var rows []table.Row
+	var keys []string
 
 	switch m.tab {
 	case tabHistory:
@@ -610,6 +623,7 @@ func (m *Model) refresh() {
 				continue
 			}
 			m.visible = append(m.visible, i)
+			keys = append(keys, "h/"+c.Source+"/"+c.ID)
 			rows = append(rows, table.Row{
 				c.NotBefore.Format("2006-01-02"), c.NotAfter.Format("2006-01-02"), m.certStatus(c),
 				ct.IssuerCN(c.Issuer), c.Source, names,
@@ -623,6 +637,7 @@ func (m *Model) refresh() {
 				continue
 			}
 			m.visible = append(m.visible, i)
+			keys = append(keys, fmt.Sprintf("l/%s/%d", mt.Log, mt.Index))
 			kind := "cert"
 			if mt.Precert {
 				kind = "precert"
@@ -637,6 +652,7 @@ func (m *Model) refresh() {
 				continue
 			}
 			m.visible = append(m.visible, i)
+			keys = append(keys, "n/"+n)
 			s := m.names[n]
 			rows = append(rows, table.Row{
 				n, strings.Join(m.nameTags(s), " "), fmt.Sprint(s.seen),
@@ -650,6 +666,7 @@ func (m *Model) refresh() {
 				continue
 			}
 			m.visible = append(m.visible, i)
+			keys = append(keys, "g/"+h.log.URL)
 			kind := "6962"
 			if h.log.Tiled {
 				kind = "tiled"
@@ -664,13 +681,23 @@ func (m *Model) refresh() {
 		}
 	}
 
-	m.rows = rows
+	m.rows, m.rowKeys = rows, keys
 	cols, keep := fitColumns(m.columnSpecs(), m.innerWidth())
 	m.keep = keep
 	// Rows must never be wider than the columns, or the table panics while rendering.
+	// Emptying the table resets its cursor, which is why the selection is restored below.
 	m.table.SetRows(nil)
 	m.table.SetColumns(cols)
 	m.applyRows()
+
+	target := slices.Index(keys, prevKey)
+	if target < 0 && prevCur >= 0 && len(rows) > 0 {
+		target = min(prevCur, len(rows)-1)
+	}
+	if target >= 0 && target != m.table.Cursor() {
+		m.table.SetCursor(target)
+		m.applyRows() // the unstyled row has to follow the cursor
+	}
 }
 
 // applyRows hands the rows to the table, keeping only the columns that fit and
