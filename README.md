@@ -1,10 +1,12 @@
 # ctq
 
-Query [Certificate Transparency](https://certificate.transparency.dev/) for a domain.
+An interactive [Certificate Transparency](https://certificate.transparency.dev/) explorer for the terminal.
 
-`ctq` finds the TLS certificates issued for a domain and its subdomains. It looks up past certificates through CT aggregators, and it can tail the CT logs themselves to report new certificates within seconds of issuance. Typical uses are subdomain discovery, spotting certificates you didn't request, and keeping an inventory of what's exposed.
+![The Names tab: every name found for example.com, with certificate count, first certificate, expiry and issuers](docs/screenshots/names.png)
 
-It runs as a plain CLI for scripts and pipes, or as an interactive TUI.
+Point `ctq` at a domain and it shows every TLS certificate issued for it and its subdomains. Past certificates come from CT aggregators; new ones stream in straight from the CT logs within seconds of being logged. Typical uses are subdomain discovery, spotting certificates you didn't request, and keeping an inventory of what's exposed.
+
+The same engine is available as plain CLI commands for scripts and pipes.
 
 ## Install
 
@@ -22,12 +24,74 @@ cd ctq
 go build .
 ```
 
-## Usage
+## The TUI
+
+```sh
+ctq tui example.com
+ctq tui            # opens on the domain prompt
+```
+
+The search and the live feed start together. Press `d` at any time to switch to another domain.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/searching.png" alt="First launch: the search runs while the live feed connects to 64 CT logs"></td>
+    <td width="50%"><img src="docs/screenshots/history.png" alt="The History tab: one row per certificate, with validity, issuer and source"></td>
+  </tr>
+  <tr>
+    <td>On launch, the search runs while the live feed connects to every CT log.</td>
+    <td>History lists one row per certificate. The header shows which source answered: here crt.sh failed and <code>auto</code> fell back to Cert Spotter.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/live.png" alt="The Live tab while watching 64 CT logs"></td>
+    <td width="50%"><img src="docs/screenshots/names.png" alt="The Names tab sorted by zone"></td>
+  </tr>
+  <tr>
+    <td>Live shows certificates as they're logged. Until one arrives, it says how many logs it's watching.</td>
+    <td>Names merges History and Live into one row per name, sorted by zone so a subdomain's children stay together.</td>
+  </tr>
+</table>
+
+| Tab | Content |
+|-----|---------|
+| History | certificates already logged, from crt.sh or Cert Spotter |
+| Live | certificates arriving from the CT logs, newest first |
+| Names | every unique name from both, with status, certificate count, first certificate, latest expiry and issuers |
+| Logs | health of each CT log the live feed reads: position, lag, status and last error |
+
+Names sorts by zone by default (`api.dev.example.com` next to `web.dev.example.com`). Press `o` to sort by newest first certificate, soonest expiry, or most certificates. The status column tags each name:
+
+| Tag | Meaning |
+|-----|---------|
+| `new` | first certificate in the last 7 days |
+| `live` | seen in the live feed this session |
+| `expiring` | latest certificate expires within 14 days |
+| `expired` | every certificate for the name has expired |
+
+A log that fails a poll shows as `retrying` and is retried on the next poll. After 3 failures in a row it shows as `failing`. Tiled logs sometimes publish a checkpoint before its tiles are readable, so an occasional `retrying` is normal.
+
+| Key | Action |
+|-----|--------|
+| `d` | search a different domain |
+| `tab`, `shift+tab`, `1`-`4` | switch tab |
+| `↑` `↓` | move |
+| `/` | filter by name, issuer or log (`esc` clears) |
+| `enter` | show details for the selected row |
+| `o` | change the sort order (Names tab) |
+| `r` | search again |
+| `s` | cycle the search source |
+| `w` | turn the live feed on or off |
+| `q` | quit |
+
+`ctq tui` accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, and `-no-live` to start with the live feed off.
+
+## CLI
+
+The TUI is built on two commands you can also run on their own:
 
 ```
 ctq search [flags] <domain>   certificates already logged (crt.sh, Cert Spotter)
 ctq watch  [flags] <domain>   new certificates, tailed directly from all CT logs
-ctq tui    [flags] [domain]   interactive: history, live feed and subdomain inventory
 ```
 
 The domain covers its subdomains by default. Pass `-exact` to match only the domain itself. Wildcard input such as `*.example.com` is treated as `example.com`.
@@ -74,48 +138,6 @@ Each match prints one line with the time, entry type (`cert` or `precert`), issu
 
 Without `-state`, `watch` starts at the current end of each log and only reports certificates logged after it starts. If `-v` shows lag growing, raise `-workers`.
 
-### tui
-
-```sh
-ctq tui example.com
-ctq tui            # opens on the domain prompt
-```
-
-The TUI has four tabs:
-
-| Tab | Content |
-|-----|---------|
-| History | certificates from `search` |
-| Live | certificates arriving from the CT logs, newest first |
-| Names | every unique name from both, with status, certificate count, first certificate, latest expiry and issuers |
-| Logs | health of each CT log the live feed reads: position, lag, status and last error |
-
-The Names tab sorts by zone by default, so a subdomain's children stay together (`api.dev.example.com` next to `web.dev.example.com`). Press `o` to sort by newest first certificate, soonest expiry, or most certificates. The status column tags each name:
-
-| Tag | Meaning |
-|-----|---------|
-| `new` | first certificate in the last 7 days |
-| `live` | seen in the live feed this session |
-| `expiring` | latest certificate expires within 14 days |
-| `expired` | every certificate for the name has expired |
-
-A log that fails a poll shows as `retrying` and is retried on the next poll. After 3 failures in a row it shows as `failing`. Tiled logs sometimes publish a checkpoint before its tiles are readable, so an occasional `retrying` is normal.
-
-| Key | Action |
-|-----|--------|
-| `d` | search a different domain |
-| `tab`, `shift+tab`, `1`-`4` | switch tab |
-| `↑` `↓` | move |
-| `/` | filter by name, issuer or log (`esc` clears) |
-| `enter` | show details for the selected row |
-| `o` | change the sort order (Names tab) |
-| `r` | search again |
-| `s` | cycle the search source |
-| `w` | turn the live feed on or off |
-| `q` | quit |
-
-It accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, and `-no-live` to start with the live feed off.
-
 ## How it works
 
 Certificate Transparency logs are append-only Merkle trees. Chrome and Safari reject publicly trusted certificates that weren't logged, so CAs submit every certificate they issue. The logs can only be read by position: there is no way to ask a log for one domain's certificates. Searching by domain needs a service that has read every log and indexed the result.
@@ -142,6 +164,15 @@ So `ctq` uses two kinds of sources:
 - crt.sh is a free, shared service and is often overloaded. Expect timeouts on large domains; `auto` falls back to Cert Spotter.
 - Cert Spotter doesn't return expired certificates, so `-expired` only works with crt.sh.
 - Duplicate detection in `watch` keeps a bounded set of recent certificates, so a rare duplicate can get through on a long run.
+
+## Related projects
+
+`ctq` is for exploring a domain interactively. For other jobs, these tools are a better fit:
+
+- [certspotter](https://github.com/SSLMate/certspotter): unattended monitoring of a watchlist, with alerts through scripts or email. Made by SSLMate, who also run the Cert Spotter API that `ctq search` uses.
+- [gungnir](https://github.com/g0ldencybersec/gungnir): streams new domains from all CT logs to stdout, JSONL or NATS, for recon pipelines.
+- [subfinder](https://github.com/projectdiscovery/subfinder): passive subdomain enumeration from many sources, crt.sh among them.
+- [ctfr](https://github.com/UnaPibaGeek/ctfr) and [crt](https://github.com/cemulus/crt): quick crt.sh subdomain lookups from the command line.
 
 ## Development
 
