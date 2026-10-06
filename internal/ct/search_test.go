@@ -206,3 +206,57 @@ func TestAutoReturnsLastError(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestTraceTagsEachSource(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, `[]`)
+	}))
+	defer srv.Close()
+
+	type event struct {
+		source string
+		level  Level
+		msg    string
+	}
+	var events []event
+	ctx := WithTracer(context.Background(), func(source string, level Level, msg string) {
+		events = append(events, event{source, level, msg})
+	})
+	failing := &fakeSearcher{name: "crtsh-db", err: fmt.Errorf("dial timeout")}
+	web := CrtSh{Client: testClient(1), BaseURL: srv.URL + "/?token=secret&"}
+	if _, err := (Auto{Sources: []Searcher{failing, web}}).Search(ctx, "example.com", true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []event{
+		{"auto", LevelInfo, "trying crtsh-db"},
+		{"auto", LevelWarn, "dial timeout; falling back to crtsh"},
+		{"auto", LevelInfo, "trying crtsh"},
+		{"crtsh", LevelInfo, "GET " + srv.URL + "/ (attempt 1 of 2)"},
+		{"crtsh", LevelWarn, "attempt 1 failed after"},
+		{"crtsh", LevelInfo, "GET " + srv.URL + "/ (attempt 2 of 2)"},
+		{"crtsh", LevelInfo, "HTTP 200, 2 bytes in"},
+		{"crtsh", LevelInfo, "0 rows"},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("got %d events: %+v", len(events), events)
+	}
+	for i, w := range want {
+		e := events[i]
+		if e.source != w.source || e.level != w.level || !strings.HasPrefix(e.msg, w.msg) {
+			t.Errorf("event %d = %+v, want prefix %+v", i, e, w)
+		}
+		if strings.Contains(e.msg, "secret") {
+			t.Errorf("event %d leaks the query string: %q", i, e.msg)
+		}
+	}
+}
+
+func TestTraceWithoutTracerIsNoop(t *testing.T) {
+	Trace(context.Background(), LevelError, "nobody listens") // must not panic
+}

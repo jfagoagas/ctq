@@ -44,6 +44,7 @@ type dbRow struct {
 }
 
 func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
+	ctx = withSource(ctx, s.Name())
 	if s.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
@@ -59,8 +60,11 @@ func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeE
 		conn.Close(closeCtx)
 	}()
 
+	Trace(ctx, LevelInfo, "query sent; crt.sh's shared pool queues it (often 45s or more), then it runs")
+	start := time.Now()
 	rows, err := conn.Query(ctx, crtshDBQuery, domain)
 	if err != nil {
+		Trace(ctx, LevelError, "query failed after %s: %v", since(start), err)
 		return nil, fmt.Errorf("crt.sh db: %w", err)
 	}
 	var raw []dbRow
@@ -73,13 +77,16 @@ func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeE
 		raw = append(raw, r)
 	}
 	if err := rows.Err(); err != nil {
+		Trace(ctx, LevelError, "query failed after %s: %v", since(start), err)
 		return nil, fmt.Errorf("crt.sh db: %w", err)
 	}
+	Trace(ctx, LevelInfo, "%d rows in %s", len(raw), since(start))
 
 	certs, skipped := fromDBRows(raw, domain, subdomains, includeExpired, time.Now())
 	if skipped > 0 {
-		warnf(s.Warn, "crt.sh db: skipped %d certificates that could not be parsed", skipped)
+		searchWarnf(ctx, s.Warn, "crt.sh db: skipped %d certificates that could not be parsed", skipped)
 	}
+	Trace(ctx, LevelInfo, "%d certificates after removing precertificate duplicates and out-of-scope rows", len(certs))
 	return certs, nil
 }
 
@@ -91,25 +98,39 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 	var last error
 	timeouts := 0
 	for attempt := 0; attempt <= s.Retries; attempt++ {
+		Trace(ctx, LevelInfo, "connecting to %s:5432 (attempt %d of %d)", crtshDBHost, attempt+1, s.Retries+1)
+		start := time.Now()
 		conn, err := pgx.ConnectConfig(ctx, cfg)
 		if err == nil {
+			Trace(ctx, LevelInfo, "connected in %s", since(start))
 			return conn, nil
 		}
 		kind := classifyConnErr(err)
 		if kind == connTimeout {
 			timeouts++
 		}
-		if ctx.Err() != nil || kind == connFatal || timeouts > 1 {
+		switch {
+		case ctx.Err() != nil:
+			Trace(ctx, LevelError, "attempt %d failed after %s: %v; out of time", attempt+1, since(start), err)
+			return nil, err
+		case kind == connFatal:
+			Trace(ctx, LevelError, "attempt %d failed: %v; TLS verification failures are not retried", attempt+1, err)
+			return nil, err
+		case timeouts > 1:
+			Trace(ctx, LevelError, "attempt %d timed out after %s: %v; second timeout, port 5432 may be blocked on this network", attempt+1, since(start), err)
 			return nil, err
 		}
 		last = err
 		if attempt == s.Retries {
+			Trace(ctx, LevelError, "attempt %d failed after %s: %v; no retries left", attempt+1, since(start), err)
 			break
 		}
+		delay := s.Backoff << attempt
+		Trace(ctx, LevelWarn, "attempt %d failed after %s: %v; retrying in %s", attempt+1, since(start), err, delay)
 		select {
 		case <-ctx.Done():
 			return nil, last
-		case <-time.After(s.Backoff << attempt):
+		case <-time.After(delay):
 		}
 	}
 	return nil, fmt.Errorf("giving up after %d attempts: %w", s.Retries+1, last)

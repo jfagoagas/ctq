@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -58,7 +59,20 @@ type sink struct {
 	mu       sync.Mutex
 	warnings []warning
 	logs     map[string]*logHealth
+	events   []sourceEvent // oldest first, at most maxSourceEvents
+	eventSeq int
 }
+
+// sourceEvent is one line of search activity in the Sources tab.
+type sourceEvent struct {
+	seq    int // stable row identity while older events roll off
+	at     time.Time
+	source string
+	level  ct.Level
+	msg    string
+}
+
+const maxSourceEvents = 500
 
 type warning struct {
 	at   time.Time
@@ -67,6 +81,7 @@ type warning struct {
 
 type snapshot struct {
 	lastWarning warning
+	events      []sourceEvent // oldest first
 	logs        []logHealth // sorted by operator, then name
 	counts      [4]int      // indexed by logStatus
 	totalLag    uint64
@@ -88,6 +103,19 @@ func (s *sink) Write(p []byte) (int, error) {
 		s.warnings = s.warnings[n-50:]
 	}
 	return len(p), nil
+}
+
+// trace is the ct.Tracer for searches. It runs on the search goroutine.
+func (s *sink) trace(source string, level ct.Level, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventSeq++
+	// pgx joins per-address errors with newlines and tabs, which would break table rows.
+	msg = strings.Join(strings.Fields(msg), " ")
+	s.events = append(s.events, sourceEvent{seq: s.eventSeq, at: time.Now(), source: source, level: level, msg: msg})
+	if n := len(s.events); n > maxSourceEvents {
+		s.events = s.events[n-maxSourceEvents:]
+	}
 }
 
 func (s *sink) health(l ct.Log) *logHealth {
@@ -134,6 +162,7 @@ func (s *sink) snapshot() snapshot {
 	if n := len(s.warnings); n > 0 {
 		snap.lastWarning = s.warnings[n-1]
 	}
+	snap.events = slices.Clone(s.events)
 	for _, h := range s.logs {
 		snap.logs = append(snap.logs, *h)
 		snap.counts[h.status()]++

@@ -16,12 +16,6 @@ type Searcher interface {
 	Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error)
 }
 
-func warnf(w io.Writer, format string, args ...any) {
-	if w != nil {
-		fmt.Fprintf(w, "ctq: "+format+"\n", args...)
-	}
-}
-
 // CrtSh queries crt.sh. One request, full history including expired certs,
 // but its Postgres kills queries after ~10s, so big domains often fail.
 type CrtSh struct {
@@ -41,6 +35,7 @@ type crtshRow struct {
 }
 
 func (s CrtSh) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
+	ctx = withSource(ctx, s.Name())
 	base := s.BaseURL
 	if base == "" {
 		base = "https://crt.sh/"
@@ -63,6 +58,7 @@ func (s CrtSh) Search(ctx context.Context, domain string, subdomains, includeExp
 		// crt.sh reports DB timeouts as HTML pages.
 		return nil, fmt.Errorf("crt.sh: expected JSON, got %s", snippet(resp.Body))
 	}
+	Trace(ctx, LevelInfo, "%d rows", len(rows))
 
 	certs := make([]Certificate, 0, len(rows))
 	for _, r := range rows {
@@ -135,8 +131,9 @@ func nextCursor(link string) string {
 }
 
 func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
+	ctx = withSource(ctx, s.Name())
 	if includeExpired {
-		warnf(s.Warn, "certspotter does not return expired certificates, use -source crtsh-db for full history")
+		searchWarnf(ctx, s.Warn, "certspotter does not return expired certificates, use -source crtsh-db for full history")
 	}
 	base := s.BaseURL
 	if base == "" {
@@ -154,6 +151,9 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 	var header map[string]string
 	if s.APIKey != "" {
 		header = map[string]string{"Authorization": "Bearer " + s.APIKey}
+		Trace(ctx, LevelInfo, "using API key from CERTSPOTTER_API_KEY")
+	} else {
+		Trace(ctx, LevelInfo, "no API key: the free quota is 10 full-domain queries per hour")
 	}
 
 	var certs []Certificate
@@ -162,7 +162,7 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 		if err != nil {
 			if page > 0 && ctx.Err() == nil {
 				// Partial results beat none: page 1 alone is often enough for small domains.
-				warnf(s.Warn, "certspotter: page %d failed, results are incomplete: %v", page+1, err)
+				searchWarnf(ctx, s.Warn, "certspotter: page %d failed, results are incomplete: %v", page+1, err)
 				return certs, nil
 			}
 			return certs, fmt.Errorf("certspotter: %w", err)
@@ -187,13 +187,14 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 			}
 			certs = append(certs, c)
 		}
+		Trace(ctx, LevelInfo, "page %d: %d issuances, %d in scope so far", page+1, len(rows), len(certs))
 		after := nextCursor(resp.Header.Get("Link"))
 		if after == "" {
 			return certs, nil
 		}
 		q.Set("after", after)
 	}
-	warnf(s.Warn, "certspotter: stopped after %d pages, results are incomplete", maxPages)
+	searchWarnf(ctx, s.Warn, "certspotter: stopped after %d pages, results are incomplete", maxPages)
 	return certs, nil
 }
 
@@ -207,14 +208,16 @@ func (Auto) Name() string { return "auto" }
 
 func (a Auto) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
 	var err error
+	actx := withSource(ctx, a.Name())
 	for i, s := range a.Sources {
+		Trace(actx, LevelInfo, "trying %s", s.Name())
 		var certs []Certificate
 		certs, err = s.Search(ctx, domain, subdomains, includeExpired)
 		if err == nil || ctx.Err() != nil {
 			return certs, err
 		}
 		if i+1 < len(a.Sources) {
-			warnf(a.Warn, "%v; falling back to %s", err, a.Sources[i+1].Name())
+			searchWarnf(actx, a.Warn, "%v; falling back to %s", err, a.Sources[i+1].Name())
 		}
 	}
 	return nil, err

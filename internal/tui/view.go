@@ -45,6 +45,16 @@ func styleLogStatus(s logStatus) string {
 	return s.String()
 }
 
+func styleLevel(l ct.Level, s string) string {
+	switch l {
+	case ct.LevelWarn:
+		return styleWarn.Render(s)
+	case ct.LevelError:
+		return styleErr.Render(s)
+	}
+	return s
+}
+
 // View declares the alt screen itself. In Bubble Tea v2 that's a property of the
 // view, not a program option.
 func (m *Model) View() tea.View {
@@ -128,6 +138,8 @@ func (m *Model) emptyMessage() string {
 			return "The live feed is off. Press w to start it and see each log's health here."
 		}
 		return m.spinner.View() + " Connecting to the CT logs…"
+	case tabSources:
+		return "No search activity yet. Every search logs its connections, requests, retries and fallbacks here."
 	}
 	return ""
 }
@@ -162,7 +174,11 @@ func (m *Model) tabsTitle() string {
 	} else if n := m.snap.counts[logRetrying]; n > 0 {
 		logs += styleWarn.Render(fmt.Sprintf(" !%d", n))
 	}
-	labels := []string{fmt.Sprintf("1 History %d", len(m.history)), live, fmt.Sprintf("3 Names %d", len(m.names)), logs}
+	sources := "5 Sources"
+	if m.searchErr != nil {
+		sources += styleErr.Render(" !")
+	}
+	labels := []string{fmt.Sprintf("1 History %d", len(m.history)), live, fmt.Sprintf("3 Names %d", len(m.names)), logs, sources}
 	out := make([]string, len(labels))
 	for i, l := range labels {
 		if tab(i) == m.tab {
@@ -200,7 +216,8 @@ func (m *Model) statusView() string {
 	case m.searching:
 		left = m.spinner.View() + " searching " + m.source + "…"
 	case m.searchErr != nil:
-		left = styleErr.Render("search failed: " + m.searchErr.Error())
+		// The error is often longer than the line; the Sources tab has all of it.
+		left = styleErr.Render("search failed") + styleDim.Render(" (full log in 5 Sources): ") + styleErr.Render(m.searchErr.Error())
 	default:
 		left = fmt.Sprintf("history: %d certs in %s", len(m.history), m.searchTook.Round(100*time.Millisecond))
 	}
@@ -242,7 +259,7 @@ func (m *Model) liveStatus() string {
 }
 
 func (m *Model) helpView() string {
-	keys := "d domain · tab/1-4 switch · / filter · enter details · r search · s source · w live · q quit"
+	keys := "d domain · tab/1-5 switch · / filter · enter details · r search · s source · w live · q quit"
 	switch {
 	case m.editingDomain:
 		keys = "enter search · esc cancel · ctrl+c quit"
@@ -333,6 +350,23 @@ func (m *Model) detailLines() []string {
 			field("status", status),
 			field("last err", lastErr),
 		}
+	case tabSources:
+		if idx >= len(m.snap.events) {
+			return nil
+		}
+		e := m.snap.events[idx]
+		level := [...]string{"info", "warning", "error"}[e.level]
+		lines := []string{field("event", e.at.Local().Format("2006-01-02 15:04:05.000")+"  "+e.source+"  "+styleLevel(e.level, level))}
+		// The point of this tab: errors the status line truncates, wrapped in full.
+		width := max(m.innerWidth()-lipgloss.Width(styleLabel.Render("")), 20)
+		for i, l := range strings.Split(ansi.Wrap(e.msg, width, " "), "\n") {
+			label := ""
+			if i == 0 {
+				label = "message"
+			}
+			lines = append(lines, field(label, styleLevel(e.level, l)))
+		}
+		return lines
 	}
 	return nil
 }

@@ -76,6 +76,7 @@ The search and the live feed start together. Press `d` at any time to switch to 
 | Live | certificates arriving from the CT logs, newest first |
 | Names | every unique name from both, with status, certificate count, first certificate, latest expiry and issuers |
 | Logs | health of each CT log the live feed reads: position, lag, status and last error |
+| Sources | what each search source did: connections, requests, retries, pages and fallbacks, newest first. Press enter on a row for the full, untruncated message |
 
 Names sorts by zone by default (`api.dev.example.com` next to `web.dev.example.com`). Press `o` to sort by newest first certificate, soonest expiry, or most certificates. The status column tags each name:
 
@@ -131,6 +132,7 @@ ctq search -source crtsh -expired example.com
 | `-expired` | `false` | include expired certificates (crt.sh sources only) |
 | `-issuer` | | only certificates whose issuer contains this text |
 | `-timeout` | `60s` | per-request timeout (`crtsh-db` always gets at least 3m) |
+| `-v` | `false` | print each source's connections, requests, retries and fallbacks to stderr |
 
 `auto` tries crt.sh's database first, then the crt.sh API, then Cert Spotter. crt.sh fails often under load, and some networks block the database port (5432).
 

@@ -52,6 +52,7 @@ const (
 	tabLive
 	tabNames
 	tabLogs
+	tabSources
 	numTabs
 )
 
@@ -219,10 +220,23 @@ func (m *Model) startSearch() tea.Cmd {
 	m.searchGen++
 	gen, domain, src, search, warn := m.searchGen, m.domain, m.source, m.opts.Backend.Search, m.sink
 	m.searching, m.searchErr = true, nil
+	trace := m.sink.trace
+	ctx = ct.WithTracer(ctx, trace)
 	return func() tea.Msg {
 		start := time.Now()
+		trace("search", ct.LevelInfo, domain+" via "+src)
 		certs, err := search(ctx, domain, src, warn)
-		return searchDoneMsg{gen: gen, certs: certs, err: err, took: time.Since(start)}
+		took := time.Since(start)
+		round := took.Round(100 * time.Millisecond).String()
+		switch {
+		case errors.Is(err, context.Canceled):
+			trace("search", ct.LevelInfo, "cancelled after "+round)
+		case err != nil:
+			trace("search", ct.LevelError, "failed after "+round+": "+err.Error())
+		default:
+			trace("search", ct.LevelInfo, plural(len(certs), "certificate")+" in "+round)
+		}
+		return searchDoneMsg{gen: gen, certs: certs, err: err, took: took}
 	}
 }
 
@@ -333,7 +347,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.snap = m.sink.snapshot()
-		if m.tab == tabLogs {
+		if m.tab == tabLogs || m.tab == tabSources {
 			m.refresh()
 		}
 		return m, tick()
@@ -405,7 +419,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.setTab((m.tab + 1) % numTabs)
 	case "shift+tab":
 		m.setTab((m.tab + numTabs - 1) % numTabs)
-	case "1", "2", "3", "4":
+	case "1", "2", "3", "4", "5":
 		m.setTab(tab(msg.String()[0] - '1'))
 	case "/":
 		m.filtering = true
@@ -475,7 +489,7 @@ func (m *Model) setTab(t tab) {
 	if t == tabLive {
 		m.unseen = 0
 	}
-	if t == tabLogs {
+	if t == tabLogs || t == tabSources {
 		m.snap = m.sink.snapshot() // don't wait up to a second for the first tick
 	}
 	m.layout()
@@ -679,6 +693,17 @@ func (m *Model) refresh() {
 				h.log.Operator, h.log.Name, kind, human(h.next), human(h.lag()), styleLogStatus(h.status()), lastErr,
 			})
 		}
+	case tabSources:
+		// Newest first, like Live: the latest step of a running search is on top.
+		for i := len(m.snap.events) - 1; i >= 0; i-- {
+			e := m.snap.events[i]
+			if needle != "" && !contains(e.source+" "+e.msg, needle) {
+				continue
+			}
+			m.visible = append(m.visible, i)
+			keys = append(keys, fmt.Sprintf("s/%d", e.seq))
+			rows = append(rows, table.Row{e.at.Local().Format("15:04:05"), e.source, styleLevel(e.level, e.msg)})
+		}
 	}
 
 	m.rows, m.rowKeys = rows, keys
@@ -770,6 +795,8 @@ func (m *Model) columnSpecs() []colSpec {
 			{title: "POSITION", width: 8, drop: 1}, {title: "LAG", width: 6}, {title: "STATUS", width: 11},
 			{title: "LAST ERROR", flex: true},
 		}
+	case tabSources:
+		return []colSpec{{title: "TIME", width: 8}, {title: "SOURCE", width: 11, drop: 1}, {title: "EVENT", flex: true}}
 	}
 	return nil
 }
