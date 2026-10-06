@@ -38,12 +38,12 @@ type WatchHooks struct {
 type Options struct {
 	Domain     string // initial domain; empty opens the domain prompt
 	Subdomains bool
-	Source     string // auto | crtsh | certspotter
+	Source     string // auto | crtsh-db | crtsh | certspotter
 	Watch      bool   // start tailing logs immediately
 	Backend    Backend
 }
 
-var sources = []string{"auto", "crtsh", "certspotter"}
+var sources = []string{"auto", "crtsh-db", "crtsh", "certspotter"}
 
 type tab int
 

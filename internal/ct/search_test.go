@@ -175,22 +175,34 @@ func (f *fakeSearcher) Search(context.Context, string, bool, bool) ([]Certificat
 }
 
 func TestAutoFallsBack(t *testing.T) {
-	primary := &fakeSearcher{name: "crtsh", err: fmt.Errorf("503")}
-	fallback := &fakeSearcher{name: "certspotter", certs: []Certificate{{ID: "x"}}}
+	db := &fakeSearcher{name: "crtsh-db", err: fmt.Errorf("max_client_conn")}
+	web := &fakeSearcher{name: "crtsh", err: fmt.Errorf("503")}
+	spotter := &fakeSearcher{name: "certspotter", certs: []Certificate{{ID: "x"}}}
 	var warn strings.Builder
 
-	certs, err := Auto{Primary: primary, Fallback: fallback, Warn: &warn}.Search(context.Background(), "example.com", true, false)
-	if err != nil || len(certs) != 1 || fallback.calls != 1 {
+	certs, err := Auto{Sources: []Searcher{db, web, spotter}, Warn: &warn}.Search(context.Background(), "example.com", true, false)
+	if err != nil || len(certs) != 1 || web.calls != 1 || spotter.calls != 1 {
 		t.Fatalf("certs=%v err=%v", certs, err)
 	}
-	if !strings.Contains(warn.String(), "falling back to certspotter") {
-		t.Errorf("warning = %q", warn.String())
+	for _, want := range []string{"max_client_conn; falling back to crtsh", "503; falling back to certspotter"} {
+		if !strings.Contains(warn.String(), want) {
+			t.Errorf("warning %q missing from %q", want, warn.String())
+		}
 	}
 
-	primary.err = nil
-	fallback.calls = 0
-	Auto{Primary: primary, Fallback: fallback}.Search(context.Background(), "example.com", true, false)
-	if fallback.calls != 0 {
-		t.Error("fallback called although primary succeeded")
+	db.err = nil
+	web.calls, spotter.calls = 0, 0
+	Auto{Sources: []Searcher{db, web, spotter}}.Search(context.Background(), "example.com", true, false)
+	if web.calls != 0 || spotter.calls != 0 {
+		t.Error("fallback called although the first source succeeded")
+	}
+}
+
+func TestAutoReturnsLastError(t *testing.T) {
+	a := &fakeSearcher{name: "a", err: fmt.Errorf("first")}
+	b := &fakeSearcher{name: "b", err: fmt.Errorf("last")}
+	_, err := Auto{Sources: []Searcher{a, b}}.Search(context.Background(), "example.com", true, false)
+	if err == nil || err.Error() != "last" {
+		t.Fatalf("err = %v", err)
 	}
 }

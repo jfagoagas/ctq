@@ -270,7 +270,7 @@ func (m *Model) detailLines() []string {
 	case tabHistory:
 		c := m.history[idx]
 		source := c.Source + "  id " + c.ID
-		if c.Source == "crtsh" {
+		if c.Source == "crtsh" || c.Source == "crtsh-db" {
 			source += "  https://crt.sh/?id=" + c.ID
 		}
 		return []string{

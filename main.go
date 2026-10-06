@@ -84,10 +84,10 @@ func parseArgs(fs *flag.FlagSet, args []string) (string, error) {
 func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	source := fs.String("source", "auto", "auto | crtsh | certspotter")
+	source := fs.String("source", "auto", "auto | crtsh-db | crtsh | certspotter")
 	output := fs.String("o", "names", "names | table | json")
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
-	expired := fs.Bool("expired", false, "include expired certificates (crt.sh only)")
+	expired := fs.Bool("expired", false, "include expired certificates (crt.sh sources only)")
 	issuer := fs.String("issuer", "", "only certs whose issuer contains this (case-insensitive)")
 	timeout := fs.Duration("timeout", 60*time.Second, "per-request timeout")
 	domain, err := parseArgs(fs, args)
@@ -119,14 +119,21 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 func newSearcher(source string, timeout time.Duration, warn io.Writer) (ct.Searcher, error) {
 	spotter := ct.CertSpotter{Client: ct.NewClient(timeout, 2), APIKey: os.Getenv("CERTSPOTTER_API_KEY"), Warn: warn}
+	// The guest pool queues every statement for about a minute before running it, and
+	// crt.sh often refuses connections for tens of seconds: 4 retries back off for 75s.
+	db := ct.CrtShDB{Timeout: max(timeout, 3*time.Minute), Retries: 4, Backoff: 5 * time.Second, Warn: warn}
 	switch source {
+	case "crtsh-db":
+		return db, nil
 	case "crtsh":
 		return ct.CrtSh{Client: ct.NewClient(timeout, 3)}, nil
 	case "certspotter":
 		return spotter, nil
 	case "auto":
-		// Short leash on crt.sh: when its DB is overloaded, minutes of retries only delay the fallback.
-		return ct.Auto{Primary: ct.CrtSh{Client: ct.NewClient(min(timeout, 30*time.Second), 1)}, Fallback: spotter, Warn: warn}, nil
+		// Short leash on the crt.sh API: when its DB is overloaded, minutes of retries only delay the fallback.
+		// It stays in the chain for networks that block port 5432.
+		web := ct.CrtSh{Client: ct.NewClient(min(timeout, 30*time.Second), 1)}
+		return ct.Auto{Sources: []ct.Searcher{db, web, spotter}, Warn: warn}, nil
 	}
 	return nil, fmt.Errorf("unknown source %q", source)
 }
@@ -274,9 +281,9 @@ func newWatcher(ctx context.Context, c watchConfig) (*ct.Watcher, error) {
 func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	source := fs.String("source", "auto", "auto | crtsh | certspotter (press s to cycle)")
+	source := fs.String("source", "auto", "auto | crtsh-db | crtsh | certspotter (press s to cycle)")
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
-	expired := fs.Bool("expired", false, "include expired certificates in history (crt.sh only)")
+	expired := fs.Bool("expired", false, "include expired certificates in history (crt.sh sources only)")
 	noLive := fs.Bool("no-live", false, "don't tail CT logs on start (press w to toggle)")
 	timeout := fs.Duration("timeout", 60*time.Second, "per-request timeout for search")
 	interval := fs.Duration("interval", 15*time.Second, "poll interval per log")
