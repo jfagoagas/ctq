@@ -70,6 +70,8 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 			req.Header.Set(k, v)
 		}
 
+		Trace(ctx, LevelInfo, "GET %s (attempt %d of %d)", redact(rawURL), attempt+1, c.Retries+1)
+		start := time.Now()
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -84,16 +86,19 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 			case rerr != nil:
 				last = rerr
 			case resp.StatusCode < 300:
+				Trace(ctx, LevelInfo, "HTTP %d, %d bytes in %s", resp.StatusCode, len(body), since(start))
 				return &Response{Header: resp.Header, Body: body}, nil
 			default:
 				herr := &HTTPError{URL: redact(rawURL), Code: resp.StatusCode, Body: snippet(body)}
 				if !retryable(resp.StatusCode) {
+					Trace(ctx, LevelError, "%v (not retryable)", herr)
 					return nil, herr
 				}
 				last = herr
 				if wait, ok := retryAfter(resp.Header.Get("Retry-After")); ok {
 					if wait > c.MaxRetryAfter {
 						// Cert Spotter asks for up to an hour. Fail now instead of hanging the CLI.
+						Trace(ctx, LevelError, "%v; server asks to wait %s, giving up", herr, wait)
 						return nil, fmt.Errorf("rate limited, server asks to wait %s: %w", wait, herr)
 					}
 					delay = wait
@@ -102,8 +107,10 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 		}
 
 		if attempt == c.Retries {
+			Trace(ctx, LevelError, "attempt %d failed after %s: %v; no retries left", attempt+1, since(start), last)
 			break
 		}
+		Trace(ctx, LevelWarn, "attempt %d failed after %s: %v; retrying in %s", attempt+1, since(start), last, delay)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -112,6 +119,8 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 	}
 	return nil, fmt.Errorf("giving up after %d attempts: %w", c.Retries+1, last)
 }
+
+func since(t time.Time) string { return time.Since(t).Round(100 * time.Millisecond).String() }
 
 // IsNotFound reports whether err is an HTTP 404.
 func IsNotFound(err error) bool {

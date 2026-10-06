@@ -67,7 +67,10 @@ func TestLiveCrtShDB(t *testing.T) {
 		domain = "letsencrypt.org"
 	}
 	start := time.Now()
-	certs, err := CrtShDB{Timeout: 4 * time.Minute, Retries: 4, Backoff: 5 * time.Second}.Search(context.Background(), domain, true, true)
+	ctx := WithTracer(context.Background(), func(source string, level Level, msg string) {
+		t.Logf("%s %s [%d] %s", time.Since(start).Round(time.Second), source, level, msg)
+	})
+	certs, err := CrtShDB{Timeout: 4 * time.Minute, Retries: 4, Backoff: 5 * time.Second}.Search(ctx, domain, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}

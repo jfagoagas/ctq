@@ -90,6 +90,7 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	expired := fs.Bool("expired", false, "include expired certificates (crt.sh sources only)")
 	issuer := fs.String("issuer", "", "only certs whose issuer contains this (case-insensitive)")
 	timeout := fs.Duration("timeout", 60*time.Second, "per-request timeout")
+	verbose := fs.Bool("v", false, "print each source's connections, requests, retries and fallbacks to stderr")
 	domain, err := parseArgs(fs, args)
 	if err != nil {
 		return err
@@ -98,6 +99,11 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	s, err := newSearcher(*source, *timeout, stderr)
 	if err != nil {
 		return err
+	}
+	if *verbose {
+		ctx = ct.WithTracer(ctx, func(source string, level ct.Level, msg string) {
+			fmt.Fprintf(stderr, "%s %-11s %s%s\n", time.Now().Format("15:04:05"), source, [...]string{"", "warning: ", "error: "}[level], msg)
+		})
 	}
 	certs, err := s.Search(ctx, domain, !*exact, *expired)
 	if err != nil {

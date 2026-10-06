@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -739,4 +740,77 @@ func TestTinyTerminalDoesNotPanic(t *testing.T) {
 	m.Update(key("enter"))
 	m.Update(tea.WindowSizeMsg{Width: 20, Height: 5})
 	_ = m.render()
+}
+
+func TestSourcesTab(t *testing.T) {
+	m := New(context.Background(), Options{
+		Domain: "example.com", Subdomains: true,
+		Backend: Backend{
+			Search: func(ctx context.Context, _, _ string, _ io.Writer) ([]ct.Certificate, error) {
+				ct.Trace(ctx, ct.LevelWarn, "attempt 1 failed: dial error\n\t91.199.212.73:5432: timeout")
+				return nil, errors.New("crt.sh db: failed to connect: " + strings.Repeat("very long reason ", 20))
+			},
+			Watch: func(ctx context.Context, _ string, _ WatchHooks) error { <-ctx.Done(); return ctx.Err() },
+		},
+	})
+	m.now = func() time.Time { return now }
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m.Update(key("5"))
+	if !strings.Contains(ansi.Strip(m.render()), "No search activity yet") {
+		t.Fatal("empty state missing")
+	}
+	m.Update(key("1"))
+
+	runSearchCmd(t, m, m.startSearch())
+	if !strings.Contains(ansi.Strip(m.statusView()), "full log in 5 Sources") {
+		t.Errorf("status line doesn't point to the Sources tab: %q", ansi.Strip(m.statusView()))
+	}
+	m.Update(key("5"))
+	if m.tab != tabSources {
+		t.Fatalf("tab = %d", m.tab)
+	}
+
+	// Newest first: the failure, then the trace event, then the search start.
+	if len(m.rows) != 3 {
+		t.Fatalf("rows = %v", m.rows)
+	}
+	for i, want := range []string{"failed after", "attempt 1 failed: dial error 91.199.212.73:5432: timeout", "example.com via auto"} {
+		if got := ansi.Strip(m.rows[i][2]); !strings.Contains(got, want) {
+			t.Errorf("row %d = %q, want %q", i, got, want)
+		}
+	}
+	for _, r := range m.rows {
+		if strings.ContainsAny(ansi.Strip(r[2]), "\n\t") {
+			t.Errorf("row has a raw newline or tab: %q", r[2])
+		}
+	}
+
+	// The details pane wraps the full error that the status line truncates.
+	m.Update(key("enter"))
+	detail := ansi.Strip(m.detailBody())
+	if !strings.Contains(detail, "error") || strings.Count(detail, "very long reason") < 10 {
+		t.Errorf("details don't show the full error:\n%s", detail)
+	}
+	for _, l := range strings.Split(m.render(), "\n") {
+		if w := ansi.StringWidth(l); w > 140 {
+			t.Fatalf("line wider than the terminal (%d): %q", w, ansi.Strip(l))
+		}
+	}
+
+	m.Update(key("/"))
+	typeText(m, "dial")
+	if len(m.rows) != 1 {
+		t.Errorf("filter kept %d rows", len(m.rows))
+	}
+}
+
+func TestSinkCapsSourceEvents(t *testing.T) {
+	s := newSink()
+	for i := range maxSourceEvents + 10 {
+		s.trace("x", ct.LevelInfo, fmt.Sprint(i))
+	}
+	snap := s.snapshot()
+	if len(snap.events) != maxSourceEvents || snap.events[0].msg != "10" || snap.events[len(snap.events)-1].seq != maxSourceEvents+10 {
+		t.Errorf("events = %d, first %q", len(snap.events), snap.events[0].msg)
+	}
 }
