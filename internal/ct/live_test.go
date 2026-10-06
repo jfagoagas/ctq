@@ -54,3 +54,31 @@ func TestLiveLogs(t *testing.T) {
 		})
 	}
 }
+
+// Live check of crt.sh's Postgres: TLS through its expired certificate, the pooler,
+// and the query. Run with CTQ_LIVE=1; CTQ_LIVE_DOMAIN picks the domain. The guest
+// pool queues every statement, so this takes a minute or more.
+func TestLiveCrtShDB(t *testing.T) {
+	if os.Getenv("CTQ_LIVE") == "" {
+		t.Skip("set CTQ_LIVE=1 to hit crt.sh's database")
+	}
+	domain := os.Getenv("CTQ_LIVE_DOMAIN")
+	if domain == "" {
+		domain = "letsencrypt.org"
+	}
+	start := time.Now()
+	certs, err := CrtShDB{Timeout: 4 * time.Minute, Retries: 4, Backoff: 5 * time.Second}.Search(context.Background(), domain, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certs) == 0 {
+		t.Fatalf("no certificates for %s", domain)
+	}
+	valid := 0
+	for _, c := range certs {
+		if !c.Expired(time.Now()) {
+			valid++
+		}
+	}
+	t.Logf("%s: %d certificates (%d unexpired) in %s", domain, len(certs), valid, time.Since(start).Round(time.Second))
+}

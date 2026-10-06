@@ -136,7 +136,7 @@ func nextCursor(link string) string {
 
 func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
 	if includeExpired {
-		warnf(s.Warn, "certspotter does not return expired certificates, use -source crtsh for full history")
+		warnf(s.Warn, "certspotter does not return expired certificates, use -source crtsh-db for full history")
 	}
 	base := s.BaseURL
 	if base == "" {
@@ -197,19 +197,25 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 	return certs, nil
 }
 
-// Auto tries crt.sh first (one request, full history) and falls back to Cert Spotter.
+// Auto tries each source in order and returns the first answer.
 type Auto struct {
-	Primary, Fallback Searcher
-	Warn              io.Writer
+	Sources []Searcher
+	Warn    io.Writer
 }
 
 func (Auto) Name() string { return "auto" }
 
 func (a Auto) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
-	certs, err := a.Primary.Search(ctx, domain, subdomains, includeExpired)
-	if err == nil || ctx.Err() != nil {
-		return certs, err
+	var err error
+	for i, s := range a.Sources {
+		var certs []Certificate
+		certs, err = s.Search(ctx, domain, subdomains, includeExpired)
+		if err == nil || ctx.Err() != nil {
+			return certs, err
+		}
+		if i+1 < len(a.Sources) {
+			warnf(a.Warn, "%v; falling back to %s", err, a.Sources[i+1].Name())
+		}
 	}
-	warnf(a.Warn, "%v; falling back to %s", err, a.Fallback.Name())
-	return a.Fallback.Search(ctx, domain, subdomains, includeExpired)
+	return nil, err
 }

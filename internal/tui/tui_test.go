@@ -252,7 +252,7 @@ func TestWatchToggle(t *testing.T) {
 
 func TestSourceCycle(t *testing.T) {
 	m := newTestModel(t)
-	for _, want := range []string{"crtsh", "certspotter", "auto"} {
+	for _, want := range []string{"crtsh-db", "crtsh", "certspotter", "auto"} {
 		m.Update(key("s"))
 		if m.source != want || !m.searching {
 			t.Fatalf("source = %q searching=%v, want %q", m.source, m.searching, want)

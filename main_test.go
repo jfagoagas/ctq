@@ -39,3 +39,23 @@ func TestWriteSearchNamesDedups(t *testing.T) {
 		t.Errorf("got %q", out.String())
 	}
 }
+
+func TestNewSearcherAutoOrder(t *testing.T) {
+	s, err := newSearcher("auto", time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, src := range s.(ct.Auto).Sources {
+		got = append(got, src.Name())
+	}
+	if strings.Join(got, ",") != "crtsh-db,crtsh,certspotter" {
+		t.Errorf("auto order = %v", got)
+	}
+	if db, _ := newSearcher("crtsh-db", time.Minute, nil); db.(ct.CrtShDB).Timeout < 3*time.Minute {
+		t.Errorf("crtsh-db timeout = %s, the pool queue alone takes about a minute", db.(ct.CrtShDB).Timeout)
+	}
+	if _, err := newSearcher("bogus", time.Minute, nil); err == nil {
+		t.Error("accepted an unknown source")
+	}
+}

@@ -125,14 +125,14 @@ ctq search -source crtsh -expired example.com
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-source` | `auto` | `auto`, `crtsh` or `certspotter` |
+| `-source` | `auto` | `auto`, `crtsh-db`, `crtsh` or `certspotter` |
 | `-o` | `names` | `names`, `table` or `json` |
 | `-exact` | `false` | only the domain itself, no subdomains |
-| `-expired` | `false` | include expired certificates (crt.sh only) |
+| `-expired` | `false` | include expired certificates (crt.sh sources only) |
 | `-issuer` | | only certificates whose issuer contains this text |
-| `-timeout` | `60s` | per-request timeout |
+| `-timeout` | `60s` | per-request timeout (`crtsh-db` always gets at least 3m) |
 
-`auto` tries crt.sh first and falls back to Cert Spotter if crt.sh fails, which happens often under load.
+`auto` tries crt.sh's database first, then the crt.sh API, then Cert Spotter. crt.sh fails often under load, and some networks block the database port (5432).
 
 ### watch
 
@@ -164,9 +164,12 @@ So `ctq` uses two kinds of sources:
 
 | Command | Source | What it covers |
 |---------|--------|----------------|
-| `search` | [crt.sh](https://crt.sh) | full history including expired certificates; one request, but its database times out on large domains |
-| `search` | [Cert Spotter](https://sslmate.com/certspotter/) | unexpired certificates only; paginated and more reliable |
+| `search` (`crtsh-db`) | crt.sh's public Postgres (`guest@crt.sh:5432/certwatch`) | full history including expired certificates, also for domains with thousands of certificates; slow (the shared pool queues every query, about a minute) and needs outbound port 5432 |
+| `search` (`crtsh`) | [crt.sh](https://crt.sh) | full history including expired certificates; one request, but its database times out on large domains |
+| `search` (`certspotter`) | [Cert Spotter](https://sslmate.com/certspotter/) | unexpired certificates only; paginated and more reliable, but rate limited (the free plan allows 10 full-domain queries per hour) |
 | `watch` | the CT logs in [Chrome's log list](https://www.gstatic.com/ct/log_list/v3/log_list.json) | new entries from the moment it starts |
+
+`crtsh-db` verifies the server certificate chain and hostname against the system roots, but accepts an expired certificate: crt.sh's database certificate expired on 2026-06-21. A man in the middle still needs a publicly trusted certificate for crt.sh and its key.
 
 `watch` reads both log protocols in use today: [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) and the tiled [static-ct-api](https://c2sp.org/static-ct-api), which Let's Encrypt and others have moved to. It skips logs whose expiry window has already closed, since they receive no new certificates.
 
