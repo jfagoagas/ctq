@@ -220,6 +220,10 @@ func (m *Model) statusView() string {
 		left = styleErr.Render("search failed") + styleDim.Render(" (full log in 5 Sources): ") + styleErr.Render(m.searchErr.Error())
 	default:
 		left = fmt.Sprintf("history: %d certs in %s", len(m.history), m.searchTook.Round(100*time.Millisecond))
+		if m.fromCache {
+			left = fmt.Sprintf("history: %d certs ", len(m.history)) + styleWarn.Render("cached, fetched "+ago(m.now().Sub(m.resultAt))) +
+				styleDim.Render(" · r to refresh")
+		}
 	}
 	// Per-log errors no longer land here (they're in the Logs tab), so what's left
 	// is rare and worth reading: search fallbacks, state file problems.
