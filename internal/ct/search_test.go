@@ -3,12 +3,15 @@ package ct
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func testClient(retries int) *Client {
@@ -196,6 +199,78 @@ func TestAutoFallsBack(t *testing.T) {
 	if web.calls != 0 || spotter.calls != 0 {
 		t.Error("fallback called although the first source succeeded")
 	}
+}
+
+// stubDB is CrtShDB with a canned error; Name, backend and overloaded are the real ones.
+type stubDB struct {
+	CrtShDB
+	err error
+}
+
+func (s stubDB) Search(context.Context, string, bool, bool) ([]Certificate, error) { return nil, s.err }
+
+func TestAutoSkipsCrtShAPIWhenDBOverloaded(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, `[]`)
+	}))
+	defer srv.Close()
+	newAuto := func(dbErr error, spotter Searcher, warn *strings.Builder) Auto {
+		web := CrtSh{Client: testClient(0), BaseURL: srv.URL + "/"}
+		return Auto{Sources: []Searcher{stubDB{err: dbErr}, web, spotter}, Warn: warn}
+	}
+
+	t.Run("server side", func(t *testing.T) {
+		hits.Store(0)
+		dbErr := searchFake(t, fakePostgres(t, &pgproto3.ErrorResponse{Severity: "FATAL", Code: "08P01", Message: "no more connections allowed (max_client_conn)"}, nil), 5*time.Second)
+		spotter := &fakeSearcher{name: "certspotter", certs: []Certificate{{ID: "x"}}}
+		var warn strings.Builder
+		var traced []string
+		ctx := WithTracer(context.Background(), func(source string, level Level, msg string) {
+			if source == "auto" && level == LevelWarn {
+				traced = append(traced, msg)
+			}
+		})
+
+		certs, err := newAuto(dbErr, spotter, &warn).Search(ctx, "example.com", true, false)
+		if err != nil || len(certs) != 1 || spotter.calls != 1 {
+			t.Fatalf("certs=%v err=%v", certs, err)
+		}
+		if hits.Load() != 0 {
+			t.Error("crt.sh API queried although crt.sh's database refused the client")
+		}
+		if len(traced) != 2 ||
+			!strings.HasPrefix(traced[0], "skipping crtsh: crtsh-db failed on crt.sh's side (crt.sh refused the work: no more connections allowed (max_client_conn))") ||
+			!strings.HasSuffix(traced[1], "; falling back to certspotter") {
+			t.Errorf("trace = %q", traced)
+		}
+		if !strings.Contains(warn.String(), "skipping crtsh") {
+			t.Errorf("warnings = %q", warn.String())
+		}
+	})
+
+	t.Run("network level", func(t *testing.T) {
+		hits.Store(0)
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		dbErr := searchFake(t, l.Addr().String(), 5*time.Second) // refused, as with port 5432 blocked
+		spotter := &fakeSearcher{name: "certspotter"}
+		var warn strings.Builder
+
+		if _, err := newAuto(dbErr, spotter, &warn).Search(context.Background(), "example.com", true, false); err != nil {
+			t.Fatal(err)
+		}
+		if hits.Load() != 1 || spotter.calls != 0 {
+			t.Errorf("crt.sh API hits = %d, certspotter calls = %d; want the API to answer", hits.Load(), spotter.calls)
+		}
+		if strings.Contains(warn.String(), "skipping") || !strings.Contains(warn.String(), "falling back to crtsh") {
+			t.Errorf("warnings = %q", warn.String())
+		}
+	})
 }
 
 func TestAutoReturnsLastError(t *testing.T) {
