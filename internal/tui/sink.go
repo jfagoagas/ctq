@@ -82,8 +82,8 @@ type warning struct {
 type snapshot struct {
 	lastWarning warning
 	events      []sourceEvent // oldest first
-	logs        []logHealth // sorted by operator, then name
-	counts      [4]int      // indexed by logStatus
+	logs        []logHealth   // sorted by operator, then name
+	counts      [4]int        // indexed by logStatus
 	totalLag    uint64
 }
 
