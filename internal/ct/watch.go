@@ -274,7 +274,7 @@ func LoadState(path string) (*State, error) {
 	if path == "" {
 		return s, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is the user's own --state flag
 	if errors.Is(err, fs.ErrNotExist) {
 		return s, nil
 	}

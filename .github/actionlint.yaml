@@ -1,0 +1,7 @@
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      # actionlint (as of v1.7.12) doesn't know the "$/" same-repository prefix
+      # for reusable workflows. GitHub runs it: see the vulnscan jobs in ci.yml.
+      # Drop this once actionlint supports it.
+      - 'reusable workflow call "\$/\.github/workflows/[^"]+" at "uses" is not following the format'
