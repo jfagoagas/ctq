@@ -164,6 +164,96 @@ func TestCertSpotterKeepsPartialResults(t *testing.T) {
 	}
 }
 
+// pagedCertSpotter serves `pages` pages of one issuance each. A page numbered
+// limitAt (1-based, 0 disables it) answers 429 with an hour-long Retry-After.
+func pagedCertSpotter(t *testing.T, pages, limitAt int) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		page := 1
+		if a := r.URL.Query().Get("after"); a != "" {
+			fmt.Sscan(a, &page)
+		}
+		if page == limitAt {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if page < pages {
+			w.Header().Set("Link", fmt.Sprintf(`<%s/issuances?after=%d>; rel="next"`, srv.URL, page+1))
+		}
+		fmt.Fprintf(w, `[{"id":"%d","dns_names":["p%d.example.com"],"not_before":"2026-09-01T00:00:00Z","not_after":"2026-12-01T00:00:00Z"}]`, page, page)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+func pageTraces(traces []string) int {
+	n := 0
+	for _, m := range traces {
+		if strings.HasPrefix(m, "page ") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestCertSpotterKeyedPaginatesPastDefaultCap(t *testing.T) {
+	srv, hits := pagedCertSpotter(t, 25, 0)
+	var traces []string
+	ctx := WithTracer(context.Background(), func(_ string, _ Level, msg string) { traces = append(traces, msg) })
+	var warn strings.Builder
+	s := CertSpotter{Client: testClient(0), BaseURL: srv.URL + "/v1/issuances", APIKey: "k", MaxPages: CertSpotterKeyedMaxPages, Warn: &warn}
+	certs, err := s.Search(ctx, "example.com", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certs) != 25 || hits.Load() != 25 {
+		t.Fatalf("certs=%d hits=%d, want 25", len(certs), hits.Load())
+	}
+	if warn.Len() != 0 {
+		t.Errorf("complete search warned: %q", warn.String())
+	}
+	if n := pageTraces(traces); n != 25 {
+		t.Errorf("traced %d pages, want 25", n)
+	}
+}
+
+func TestCertSpotterRateLimitMidPagination(t *testing.T) {
+	srv, hits := pagedCertSpotter(t, 50, 23)
+	var warn strings.Builder
+	s := CertSpotter{Client: testClient(2), BaseURL: srv.URL + "/v1/issuances", APIKey: "k", MaxPages: CertSpotterKeyedMaxPages, Warn: &warn}
+	certs, err := s.Search(context.Background(), "example.com", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The long Retry-After fails page 23 at once instead of retrying it.
+	if len(certs) != 22 || hits.Load() != 23 {
+		t.Fatalf("certs=%d hits=%d, want 22 certs from 23 requests", len(certs), hits.Load())
+	}
+	if !strings.Contains(warn.String(), "rate limited on page 23, results are incomplete") {
+		t.Errorf("warning = %q", warn.String())
+	}
+}
+
+func TestCertSpotterUnkeyedStopsAtDefaultCap(t *testing.T) {
+	srv, hits := pagedCertSpotter(t, 25, 0)
+	var warn strings.Builder
+	s := CertSpotter{Client: testClient(0), BaseURL: srv.URL + "/v1/issuances", Warn: &warn}
+	certs, err := s.Search(context.Background(), "example.com", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certs) != CertSpotterMaxPages || hits.Load() != CertSpotterMaxPages {
+		t.Fatalf("certs=%d hits=%d, want %d", len(certs), hits.Load(), CertSpotterMaxPages)
+	}
+	if !strings.Contains(warn.String(), "stopped after 20 pages") {
+		t.Errorf("warning = %q", warn.String())
+	}
+}
+
 type fakeSearcher struct {
 	name  string
 	certs []Certificate
