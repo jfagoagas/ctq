@@ -37,37 +37,50 @@ Usage:
 Run "ctq <command> -h" for flags.
 `
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ct.UserAgent = "ctq/" + buildVersion()
+// Test seams: tests point these at local fakes instead of the real services.
+var (
+	searcherFor = newSearcher
+	fetchLogs   = ct.FetchLogs
+)
 
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ct.UserAgent = "ctq/" + buildVersion()
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
+}
+
+// run executes one ctq command and returns the process exit code:
+// 0 on success, 1 when the command fails, 2 for a missing or unknown command.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprint(stderr, usage)
+		return 2
+	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "search":
-		err = runSearch(ctx, os.Args[2:], os.Stdout, os.Stderr)
+		err = runSearch(ctx, args[1:], stdout, stderr)
 	case "watch":
-		err = runWatch(ctx, os.Args[2:], os.Stdout, os.Stderr)
+		err = runWatch(ctx, args[1:], stdout, stderr)
 	case "tui":
-		err = runTUI(ctx, os.Args[2:], os.Stderr)
+		err = runTUI(ctx, args[1:], stderr)
 	case "-h", "-help", "--help", "help":
-		fmt.Fprint(os.Stdout, usage)
-		return
+		fmt.Fprint(stdout, usage)
+		return 0
 	case "version", "-version", "--version":
-		fmt.Println(versionString())
-		return
+		fmt.Fprintln(stdout, versionString())
+		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "ctq: unknown command %q\n\n%s", os.Args[1], usage)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "ctq: unknown command %q\n\n%s", args[0], usage)
+		return 2
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "ctq: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "ctq: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
 func parseArgs(fs *flag.FlagSet, args []string) (string, error) {
@@ -96,7 +109,7 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 
-	s, err := newSearcher(*source, *timeout, stderr)
+	s, err := searcherFor(*source, *timeout, stderr)
 	if err != nil {
 		return err
 	}
@@ -251,7 +264,7 @@ type watchConfig struct {
 // newWatcher fetches the log list and loads saved offsets. The caller sets Emit.
 func newWatcher(ctx context.Context, c watchConfig) (*ct.Watcher, error) {
 	client := ct.NewClient(30*time.Second, 3)
-	logs, err := ct.FetchLogs(ctx, client, time.Now())
+	logs, err := fetchLogs(ctx, client, time.Now())
 	if err != nil {
 		return nil, err
 	}
