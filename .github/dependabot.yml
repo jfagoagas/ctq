@@ -23,15 +23,3 @@ updates:
     groups:
       charm:
         patterns: ["charm.land/*", "github.com/charmbracelet/*"]
-
-  # SHA-pinned hook revs in .pre-commit-config.yaml. A golangci-lint or zizmor
-  # bump must also update the matching version in ci.yml.
-  - package-ecosystem: pre-commit
-    directory: /
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    groups:
-      hooks:
-        patterns: ["*"]

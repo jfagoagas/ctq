@@ -1,5 +1,4 @@
-# golangci-lint v2 configuration. The version is pinned in
-# .pre-commit-config.yaml and .github/workflows/ci.yml; bump both together.
+# golangci-lint v2 configuration. The version is pinned in .github/workflows/ci.yml.
 version: "2"
 
 run:

@@ -31,31 +31,6 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-  # The next three jobs mirror .pre-commit-config.yaml, so a commit made with
-  # --no-verify still gets every check on the pull request.
-
-  pre-commit:
-    name: pre-commit hooks
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # go mod tidy runs with this Go; golang hooks (actionlint) build with it.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Install pre-commit
-        run: pipx install pre-commit==4.2.0
-      - name: Run hooks
-        env:
-          # These have their own jobs: golangci-lint and trufflehog below, and
-          # zizmor (same version and persona, plus code scanning upload).
-          SKIP: golangci-lint-config-verify,golangci-lint-full,trufflehog,zizmor
-        run: pre-commit run --all-files --show-diff-on-failure --color=always
-
   golangci-lint:
     name: Lint (golangci-lint)
     runs-on: ubuntu-latest
@@ -71,7 +46,7 @@ jobs:
       # Also verifies .golangci.yml against the schema (verify: true by default).
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.14.0 # same as .pre-commit-config.yaml; bump both together
+          version: v2.14.0
 
   trufflehog:
     name: Secret scan (trufflehog)

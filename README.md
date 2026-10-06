@@ -245,23 +245,14 @@ CTQ_LIVE=1 go test -run TestLive -v ./internal/ct/   # checks parsing against re
 
 Unit tests use local HTTP servers and fakes; nothing touches the network unless `CTQ_LIVE` is set.
 
-### Git hooks
+### Lint and secret scanning
 
-Checks run locally with [pre-commit](https://pre-commit.com/) (config in `.pre-commit-config.yaml`). Install the hooks once per clone:
-
-```sh
-pre-commit install --hook-type pre-commit --hook-type pre-push
-```
-
-On commit: [golangci-lint](https://golangci-lint.run/) v2 (config in `.golangci.yml`, includes gofmt and goimports), [trufflehog](https://github.com/trufflesecurity/trufflehog) on the staged changes, actionlint and zizmor on the workflows, `go mod tidy -diff`, and basic file hygiene. On push: `go test -race ./...`. The first run builds golangci-lint, trufflehog and actionlint from source with your Go, so it takes a few minutes; later runs are fast.
+CI lints every pull request with [golangci-lint](https://golangci-lint.run/) v2 (config in `.golangci.yml`, including gofmt and goimports) and scans its commits for secrets with [trufflehog](https://github.com/trufflesecurity/trufflehog). To run the same checks locally:
 
 ```sh
-pre-commit run --all-files                         # every commit-stage hook on every tracked file
-pre-commit run golangci-lint-full --all-files      # one hook
-pre-commit run --all-files --hook-stage pre-push   # the push-stage hooks
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+trufflehog git file://. --since-commit main --results=verified,unknown --fail
 ```
-
-CI runs the same checks, so `git commit --no-verify` only moves a failure to the pull request.
 
 The README screenshots and the demo GIF are made with [vhs](https://github.com/charmbracelet/vhs) from the tapes in `docs/screenshots/`. They run a real search, so they need network access and take a few minutes:
 
