@@ -27,6 +27,10 @@ type CrtShDB struct {
 	Retries int           // reconnects when the pool refuses clients
 	Backoff time.Duration
 	Warn    io.Writer
+
+	// Tests replace these; nil means pgx.ConnectConfig and time.After.
+	dial  func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error)
+	after func(time.Duration) <-chan time.Time
 }
 
 func (CrtShDB) Name() string { return "crtsh-db" }
@@ -95,12 +99,19 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	dial, after := s.dial, s.after
+	if dial == nil {
+		dial = pgx.ConnectConfig
+	}
+	if after == nil {
+		after = time.After
+	}
 	var last error
 	timeouts := 0
 	for attempt := 0; attempt <= s.Retries; attempt++ {
 		Trace(ctx, LevelInfo, "connecting to %s:5432 (attempt %d of %d)", crtshDBHost, attempt+1, s.Retries+1)
 		start := time.Now()
-		conn, err := pgx.ConnectConfig(ctx, cfg)
+		conn, err := dial(ctx, cfg)
 		if err == nil {
 			Trace(ctx, LevelInfo, "connected in %s", since(start))
 			return conn, nil
@@ -130,7 +141,7 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 		select {
 		case <-ctx.Done():
 			return nil, last
-		case <-time.After(delay):
+		case <-after(delay):
 		}
 	}
 	return nil, fmt.Errorf("giving up after %d attempts: %w", s.Retries+1, last)

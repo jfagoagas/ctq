@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -244,4 +245,133 @@ func TestClassifyConnErr(t *testing.T) {
 			t.Error("not fatal")
 		}
 	})
+}
+
+func TestCrtShDBConnectRetryBudget(t *testing.T) {
+	var (
+		refused = errors.New("dial tcp 1.2.3.4:5432: connect: connection refused")
+		full    = errors.New("FATAL: no more connections allowed (max_client_conn) (SQLSTATE 08P01)")
+		timeout = fmt.Errorf("dial tcp 1.2.3.4:5432: %w", os.ErrDeadlineExceeded)
+		badCert = fmt.Errorf("tls: %w", &tls.CertificateVerificationError{Err: errors.New("bad chain")})
+	)
+	const backoff = time.Second
+	for _, tc := range []struct {
+		name      string
+		errs      []error // one per dial; nil connects
+		wantDials int
+		wantSleep []time.Duration
+		wantErr   error
+	}{
+		{"refused uses every retry", []error{refused, refused, refused, refused, refused}, 5,
+			[]time.Duration{backoff, 2 * backoff, 4 * backoff, 8 * backoff}, refused},
+		{"max_client_conn uses every retry", []error{full, full, full, full, full}, 5,
+			[]time.Duration{backoff, 2 * backoff, 4 * backoff, 8 * backoff}, full},
+		{"refused, then connects", []error{refused, full, nil}, 3,
+			[]time.Duration{backoff, 2 * backoff}, nil},
+		{"timeout is retried once", []error{timeout, timeout}, 2,
+			[]time.Duration{backoff}, timeout},
+		{"second timeout stops the loop", []error{refused, timeout, refused, timeout}, 4,
+			[]time.Duration{backoff, 2 * backoff, 4 * backoff}, timeout},
+		{"one timeout keeps the budget", []error{timeout, refused, refused, refused, refused}, 5,
+			[]time.Duration{backoff, 2 * backoff, 4 * backoff, 8 * backoff}, refused},
+		{"timeout, then connects", []error{timeout, nil}, 2,
+			[]time.Duration{backoff}, nil},
+		{"TLS failure is not retried", []error{badCert}, 1, nil, badCert},
+		{"TLS failure after a retry", []error{refused, badCert}, 2,
+			[]time.Duration{backoff}, badCert},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dials := 0
+			var slept []time.Duration
+			s := CrtShDB{
+				Retries: 4,
+				Backoff: backoff,
+				dial: func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error) {
+					if dials >= len(tc.errs) {
+						t.Fatalf("dial %d: past the expected %d", dials+1, len(tc.errs))
+					}
+					dials++
+					return nil, tc.errs[dials-1]
+				},
+				after: func(d time.Duration) <-chan time.Time {
+					slept = append(slept, d)
+					ch := make(chan time.Time, 1)
+					ch <- time.Time{}
+					return ch
+				},
+			}
+			_, err := s.connect(context.Background())
+			if dials != tc.wantDials {
+				t.Errorf("dials = %d, want %d", dials, tc.wantDials)
+			}
+			if !slices.Equal(slept, tc.wantSleep) {
+				t.Errorf("backoff = %v, want %v", slept, tc.wantSleep)
+			}
+			if tc.wantErr == nil && err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCrtShDBConnectCancelInterruptsBackoff(t *testing.T) {
+	refused := errors.New("connection refused")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dials := 0
+	s := CrtShDB{
+		Retries: 4,
+		Backoff: time.Hour,
+		dial: func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error) {
+			dials++
+			return nil, refused
+		},
+		after: func(time.Duration) <-chan time.Time {
+			cancel()   // the caller gives up while the loop waits
+			return nil // never fires: only ctx.Done can end the wait
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.connect(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, refused) {
+			t.Errorf("err = %v, want %v", err, refused)
+		}
+		if dials != 1 {
+			t.Errorf("dials = %d, want 1", dials)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not interrupt the backoff")
+	}
+}
+
+func TestCrtShDBConnectStopsWhenOutOfTime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dials := 0
+	s := CrtShDB{
+		Retries: 4,
+		Backoff: time.Second,
+		dial: func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error) {
+			dials++
+			cancel() // the deadline passes during the dial
+			return nil, errors.New("connection refused")
+		},
+		after: func(time.Duration) <-chan time.Time {
+			t.Fatal("backed off after the context ended")
+			return nil
+		},
+	}
+	if _, err := s.connect(ctx); err == nil {
+		t.Fatal("connected")
+	}
+	if dials != 1 {
+		t.Errorf("dials = %d, want 1", dials)
+	}
 }
