@@ -3,8 +3,10 @@ package ct
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -158,7 +160,7 @@ func crtshDBConfig() (*pgx.ConnConfig, error) {
 		MinVersion: tls.VersionTLS12,
 		// Not a skip: VerifyConnection below does the full chain and hostname check.
 		InsecureSkipVerify: true,
-		VerifyConnection:   verifyIgnoringExpiry(crtshDBHost, nil),
+		VerifyConnection:   verifyWithExpiredPin(crtshDBHost, nil, crtshDBExpiredKeyPin),
 	}
 	cfg.RuntimeParams = map[string]string{"application_name": UserAgent}
 	// crt.sh sits behind a connection pooler, which breaks named prepared statements.
@@ -166,12 +168,18 @@ func crtshDBConfig() (*pgx.ConnConfig, error) {
 	return cfg, nil
 }
 
-// verifyIgnoringExpiry verifies the chain to roots (nil means the system pool) and
-// the hostname, evaluated at the leaf's last valid second once it has expired.
-// crt.sh's Postgres certificate expired on 2026-06-21 and strict verification
-// fails. This still takes a publicly trusted certificate for host, so a MITM
-// needs a CA-issued crt.sh certificate and its private key.
-func verifyIgnoringExpiry(host string, roots *x509.CertPool) func(tls.ConnectionState) error {
+// crtshDBExpiredKeyPin is the SHA-256 of the public key (SPKI) that crt.sh serves
+// on port 5432. Its certificate there expired on 2026-06-21; crt.sh's HTTPS
+// certificate, valid until 2026-12-21, uses the same key.
+const crtshDBExpiredKeyPin = "f5178a69c95d4f2a114aa431ffd770905b87755f0c4f231675c2847f6a21ebda"
+
+// verifyWithExpiredPin verifies the chain to roots (nil means the system pool) and
+// the hostname. If that fails only because the leaf has expired, and the leaf's
+// key matches pin, the chain is verified again at the leaf's last valid second.
+// Any other expired certificate for host is rejected: the exception covers one
+// key, not every crt.sh certificate ever issued. Once crt.sh renews, the strict
+// check passes and the pin is unused.
+func verifyWithExpiredPin(host string, roots *x509.CertPool, pin string) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return errors.New("server sent no certificate")
@@ -181,15 +189,23 @@ func verifyIgnoringExpiry(host string, roots *x509.CertPool) func(tls.Connection
 		for _, c := range cs.PeerCertificates[1:] {
 			opts.Intermediates.AddCert(c)
 		}
-		if time.Now().After(leaf.NotAfter) {
+		_, err := leaf.Verify(opts)
+		if err != nil && time.Now().After(leaf.NotAfter) && spkiSHA256(leaf) == pin {
+			// x509.Expired also means "not yet valid", hence the explicit date check above.
 			opts.CurrentTime = leaf.NotAfter
+			_, err = leaf.Verify(opts)
 		}
-		if _, err := leaf.Verify(opts); err != nil {
+		if err != nil {
 			// crypto/tls only wraps its built-in verification; wrap here so callers can tell.
 			return &tls.CertificateVerificationError{UnverifiedCertificates: cs.PeerCertificates, Err: err}
 		}
 		return nil
 	}
+}
+
+func spkiSHA256(c *x509.Certificate) string {
+	sum := sha256.Sum256(c.RawSubjectPublicKeyInfo)
+	return hex.EncodeToString(sum[:])
 }
 
 // fromDBRows parses and scopes rows. crt.sh stores a precertificate and its final

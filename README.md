@@ -169,7 +169,7 @@ So `ctq` uses two kinds of sources:
 | `search` (`certspotter`) | [Cert Spotter](https://sslmate.com/certspotter/) | unexpired certificates only; paginated and more reliable, but rate limited (the free plan allows 10 full-domain queries per hour) |
 | `watch` | the CT logs in [Chrome's log list](https://www.gstatic.com/ct/log_list/v3/log_list.json) | new entries from the moment it starts |
 
-`crtsh-db` verifies the server certificate chain and hostname against the system roots, but accepts an expired certificate: crt.sh's database certificate expired on 2026-06-21. A man in the middle still needs a publicly trusted certificate for crt.sh and its key.
+`crtsh-db` verifies the server certificate chain and hostname against the system roots. crt.sh's database certificate expired on 2026-06-21, so there is one exception: an expired certificate is accepted only if its key is the one pinned in the code (SHA-256 `f5178a69…21ebda`), which is also the key of crt.sh's valid HTTPS certificate. Any other expired certificate is rejected. Once crt.sh renews the database certificate, standard verification passes and the pin is no longer used.
 
 `watch` reads both log protocols in use today: [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) and the tiled [static-ct-api](https://c2sp.org/static-ct-api), which Let's Encrypt and others have moved to. It skips logs whose expiry window has already closed, since they receive no new certificates.
 

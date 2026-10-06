@@ -72,32 +72,41 @@ func (ca testCA) issue(t *testing.T, serial int64, notBefore, notAfter time.Time
 	return der
 }
 
-func TestVerifyIgnoringExpiry(t *testing.T) {
+func TestVerifyWithExpiredPin(t *testing.T) {
 	ca, other := newTestCA(t), newTestCA(t)
 	roots := x509.NewCertPool()
 	roots.AddCert(ca.cert)
 	now := time.Now()
 	day := 24 * time.Hour
+	parse := func(der []byte) *x509.Certificate {
+		t.Helper()
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	expired := func(issuer testCA, serial int64, host string) *x509.Certificate {
+		return parse(issuer.issue(t, serial, now.Add(-90*day), now.Add(-30*day), host))
+	}
 
+	pinned := expired(ca, 2, "crt.sh") // the one expired certificate the pin allows
+	pin := spkiSHA256(pinned)
 	for _, tc := range []struct {
 		name    string
-		der     []byte
+		leaf    *x509.Certificate
 		host    string
 		wantErr bool
 	}{
-		{"valid", ca.issue(t, 2, now.Add(-day), now.Add(day), "crt.sh"), "crt.sh", false},
-		{"expired", ca.issue(t, 3, now.Add(-90*day), now.Add(-30*day), "crt.sh"), "crt.sh", false},
-		{"expired, wrong host", ca.issue(t, 4, now.Add(-90*day), now.Add(-30*day), "evil.example"), "crt.sh", true},
-		{"untrusted root", other.issue(t, 5, now.Add(-day), now.Add(day), "crt.sh"), "crt.sh", true},
-		{"expired, untrusted root", other.issue(t, 6, now.Add(-90*day), now.Add(-30*day), "crt.sh"), "crt.sh", true},
-		{"not yet valid", ca.issue(t, 7, now.Add(day), now.Add(30*day), "crt.sh"), "crt.sh", true},
+		{"valid, not pinned", parse(ca.issue(t, 3, now.Add(-day), now.Add(day), "crt.sh")), "crt.sh", false},
+		{"expired, pinned key", pinned, "crt.sh", false},
+		{"expired, other key", expired(ca, 4, "crt.sh"), "crt.sh", true},
+		{"expired, pinned key, wrong host", pinned, "evil.example", true},
+		{"expired, untrusted root", expired(other, 5, "crt.sh"), "crt.sh", true},
+		{"not yet valid", parse(ca.issue(t, 6, now.Add(day), now.Add(30*day), "crt.sh")), "crt.sh", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			leaf, err := x509.ParseCertificate(tc.der)
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = verifyIgnoringExpiry(tc.host, roots)(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}})
+			err := verifyWithExpiredPin(tc.host, roots, pin)(tls.ConnectionState{PeerCertificates: []*x509.Certificate{tc.leaf}})
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -107,7 +116,12 @@ func TestVerifyIgnoringExpiry(t *testing.T) {
 		})
 	}
 
-	if err := verifyIgnoringExpiry("crt.sh", roots)(tls.ConnectionState{}); err == nil {
+	// "Not yet valid" is reported as x509.Expired too; the pin must not cover it.
+	future := parse(ca.issue(t, 7, now.Add(day), now.Add(30*day), "crt.sh"))
+	if err := verifyWithExpiredPin("crt.sh", roots, spkiSHA256(future))(tls.ConnectionState{PeerCertificates: []*x509.Certificate{future}}); err == nil {
+		t.Error("accepted a pinned certificate that is not valid yet")
+	}
+	if err := verifyWithExpiredPin("crt.sh", roots, pin)(tls.ConnectionState{}); err == nil {
 		t.Error("accepted a connection without certificates")
 	}
 }
