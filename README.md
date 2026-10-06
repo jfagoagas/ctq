@@ -2,7 +2,7 @@
 
 An interactive [Certificate Transparency](https://certificate.transparency.dev/) explorer for the terminal.
 
-![The Names tab: every name found for example.com, with certificate count, first certificate, expiry and issuers](docs/screenshots/names.png)
+![ctq searching example.com: the Sources tab follows the query through crt.sh's database, then History, Names and Live show the results](docs/screenshots/demo.gif)
 
 Point `ctq` at a domain and it shows every TLS certificate issued for it and its subdomains. Past certificates come from CT aggregators; new ones stream in straight from the CT logs within seconds of being logged. Typical uses are subdomain discovery, spotting certificates you didn't request, and keeping an inventory of what's exposed.
 
@@ -58,7 +58,7 @@ The search and the live feed start together. Press `d` at any time to switch to 
   </tr>
   <tr>
     <td>On launch, the search runs while the live feed connects to every CT log.</td>
-    <td>History lists one row per certificate. The header shows which source answered: here crt.sh failed and <code>auto</code> fell back to Cert Spotter.</td>
+    <td>History lists one row per certificate. The header shows which source answered: here <code>auto</code> got its results from crt.sh's database.</td>
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/live.png" alt="The Live tab while watching 64 CT logs"></td>
@@ -68,11 +68,17 @@ The search and the live feed start together. Press `d` at any time to switch to 
     <td>Live shows certificates as they're logged. Until one arrives, it says how many logs it's watching.</td>
     <td>Names merges History and Live into one row per name, sorted by zone so a subdomain's children stay together.</td>
   </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/sources.png" alt="The Sources tab: each step of the search, with the details of the selected event"></td>
+  </tr>
+  <tr>
+    <td colspan="2">Sources shows each step of the search: connections, retries, the wait in crt.sh's queue and the final count. Press enter for the full message, such as an error the status line cuts off.</td>
+  </tr>
 </table>
 
 | Tab | Content |
 |-----|---------|
-| History | certificates already logged, from crt.sh or Cert Spotter |
+| History | certificates already logged, from crt.sh (its database or its API) or Cert Spotter |
 | Live | certificates arriving from the CT logs, newest first |
 | Names | every unique name from both, with status, certificate count, first certificate, latest expiry and issuers |
 | Logs | health of each CT log the live feed reads: position, lag, status and last error |
@@ -92,9 +98,9 @@ A log that fails a poll shows as `retrying` and is retried on the next poll. Aft
 | Key | Action |
 |-----|--------|
 | `d` | search a different domain |
-| `tab`, `shift+tab`, `1`-`4` | switch tab |
+| `tab`, `shift+tab`, `1`-`5` | switch tab |
 | `↑` `↓` | move |
-| `/` | filter by name, issuer or log (`esc` clears) |
+| `/` | filter the current tab: names, issuers, logs or search events (`esc` clears) |
 | `enter` | show details for the selected row |
 | `o` | change the sort order (Names tab) |
 | `r` | search again |
@@ -158,6 +164,37 @@ Each match prints one line with the time, entry type (`cert` or `precert`), issu
 
 Without `-state`, `watch` starts at the current end of each log and only reports certificates logged after it starts. If `-v` shows lag growing, raise `-workers`.
 
+## Using ctq with AI agents
+
+Coding agents such as Claude Code can't drive the TUI, which needs an interactive terminal. The CLI works well for them:
+
+- `ctq search -o json example.com` prints a JSON array on stdout, one object per certificate: `id`, `source`, `issuer`, `dns_names`, `not_before`, `not_after` and `expired`. Warnings and `-v` output go to stderr, so stdout always parses.
+- `ctq search example.com` prints one name per line, the smallest output for a context window.
+- The exit status is 0 on success, including when nothing is found (an empty array), 1 on errors and 2 for an unknown command.
+- The domain argument is validated before any query, so input an agent builds from a conversation can't turn into a crt.sh wildcard.
+
+Three things trip agents up:
+
+- A search through crt.sh's database takes about a minute, sometimes more. Give the command at least 4 minutes; Claude Code's Bash tool stops a command after 2 minutes unless told otherwise. `-source certspotter` answers in seconds but only returns unexpired certificates, under a rate limit.
+- `watch` never exits on its own. Run it with a bound, for example `timeout 10m ctq watch -json example.com` (on macOS, `gtimeout` from coreutils). Each line is one JSON object.
+- When a search fails, `-v` shows each source's attempts on stderr instead of only the last error.
+
+To teach an agent all of this, add a section like this to the project's `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+## Certificate Transparency lookups
+
+Use `ctq` to find certificates and subdomains for a domain.
+
+- `ctq search -o json <domain>`: JSON array on stdout, warnings on stderr. Exit 0 even when empty.
+- Allow at least 4 minutes per search: crt.sh's database queues each query for about a minute.
+- Fast, unexpired certificates only: `-source certspotter`. Include expired certificates: `-expired`.
+- Never run `ctq tui`, it's interactive. Always run `ctq watch` under `timeout`.
+- If a search fails, rerun it with `-v` and read stderr.
+```
+
+In Claude Code, `"allow": ["Bash(ctq search:*)"]` in `.claude/settings.json` lets the agent run searches without asking each time. `search` only reads public CT data.
+
 ## How it works
 
 Certificate Transparency logs are append-only Merkle trees. Chrome and Safari reject publicly trusted certificates that weren't logged, so CAs submit every certificate they issue. The logs can only be read by position: there is no way to ask a log for one domain's certificates. Searching by domain needs a service that has read every log and indexed the result.
@@ -184,8 +221,10 @@ So `ctq` uses two kinds of sources:
 ## Limitations
 
 - `watch` doesn't verify log signatures or Merkle inclusion proofs. It trusts the log operators and TLS, which is fine for finding certificates but not for auditing logs.
-- crt.sh is a free, shared service and is often overloaded. Expect timeouts on large domains; `auto` falls back to Cert Spotter.
-- Cert Spotter doesn't return expired certificates, so `-expired` only works with crt.sh.
+- crt.sh is a free, shared service and is often overloaded. Its database queues every query for about a minute, and it sometimes refuses connections; `auto` retries, then falls back to the crt.sh API and Cert Spotter. The Sources tab and `search -v` show which step failed.
+- `crtsh-db` needs outbound access to port 5432. On networks that block it, `auto` falls back after one retry.
+- `crtsh-db` skips certificates that Go's X.509 parser rejects (some malformed certificates from public CAs), and says how many in a warning.
+- Cert Spotter doesn't return expired certificates, so `-expired` only works with the crt.sh sources.
 - Duplicate detection in `watch` keeps a bounded set of recent certificates, so a rare duplicate can get through on a long run.
 
 ## Related projects
@@ -205,6 +244,13 @@ CTQ_LIVE=1 go test -run TestLive -v ./internal/ct/   # checks parsing against re
 ```
 
 Unit tests use local HTTP servers and fakes; nothing touches the network unless `CTQ_LIVE` is set.
+
+The README screenshots and the demo GIF are made with [vhs](https://github.com/charmbracelet/vhs) from the tapes in `docs/screenshots/`. They run a real search, so they need network access and take a few minutes:
+
+```sh
+vhs docs/screenshots/screenshots.tape
+vhs docs/screenshots/demo.tape
+```
 
 CI also validates the release config, audits the workflows with [zizmor](https://docs.zizmor.sh/), and scans each platform's binary with [syft](https://github.com/anchore/syft) and [grype](https://github.com/anchore/grype). To run the same checks locally:
 
