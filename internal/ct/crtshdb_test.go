@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 type testCA struct {
@@ -312,6 +313,160 @@ func TestCrtShDBConnectRetryBudget(t *testing.T) {
 			}
 			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 				t.Errorf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// fakePostgres stands in for crt.sh's pooler. A client that connects gets
+// startupErr, or logs in when it is nil. A query then gets queryErr, or no answer
+// at all when it is nil, like a statement stuck in the pool's queue.
+func fakePostgres(t *testing.T, startupErr, queryErr *pgproto3.ErrorResponse) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				be := pgproto3.NewBackend(c, c)
+				if _, err := be.ReceiveStartupMessage(); err != nil {
+					return
+				}
+				if startupErr != nil {
+					be.Send(startupErr)
+					be.Flush()
+					return
+				}
+				be.Send(&pgproto3.AuthenticationOk{})
+				// pgx refuses simple protocol queries without these.
+				be.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
+				be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
+				be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				be.Flush()
+				for {
+					msg, err := be.Receive()
+					if err != nil {
+						return
+					}
+					if _, ok := msg.(*pgproto3.Query); ok && queryErr != nil {
+						be.Send(queryErr)
+						be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+						be.Flush()
+					}
+				}
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+// searchFake runs CrtShDB's connect and query against addr and wraps errors the
+// way CrtShDB.Search and connect do, so the error chain is the real one.
+func searchFake(t *testing.T, addr string, timeout time.Duration) error {
+	t.Helper()
+	host, port, _ := net.SplitHostPort(addr)
+	cfg, err := pgx.ParseConfig("host=" + host + " port=" + port + " user=guest dbname=certwatch sslmode=disable connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("crt.sh db: giving up after 5 attempts: %w", err)
+	}
+	defer conn.Close(context.Background())
+	rows, err := conn.Query(ctx, crtshDBQuery, "example.com")
+	if err != nil {
+		return fmt.Errorf("crt.sh db: %w", err)
+	}
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("crt.sh db: %w", err)
+	}
+	t.Fatal("query succeeded")
+	return nil
+}
+
+func TestCrtShDBOverloaded(t *testing.T) {
+	pgErr := func(code, msg string) *pgproto3.ErrorResponse {
+		return &pgproto3.ErrorResponse{Severity: "FATAL", Code: code, Message: msg}
+	}
+	closedPort := func(t *testing.T) string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		return l.Addr().String()
+	}
+	silentPort := func(t *testing.T) string {
+		// Accepts and never answers, like a firewall that drops packets after the handshake.
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l.Close() })
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+			}
+		}()
+		return l.Addr().String()
+	}
+
+	tests := []struct {
+		name       string
+		err        func(t *testing.T) error
+		overloaded bool
+	}{
+		// Server side: crt.sh answered, so the JSON API would hit the same wall.
+		{"pool full", func(t *testing.T) error {
+			return searchFake(t, fakePostgres(t, pgErr("08P01", "no more connections allowed (max_client_conn)"), nil), 5*time.Second)
+		}, true},
+		{"too many connections", func(t *testing.T) error {
+			return searchFake(t, fakePostgres(t, pgErr("53300", "sorry, too many clients already"), nil), 5*time.Second)
+		}, true},
+		{"statement timeout", func(t *testing.T) error {
+			return searchFake(t, fakePostgres(t, nil, pgErr("57014", "canceling statement due to statement timeout")), 5*time.Second)
+		}, true},
+		{"query still queued at the deadline", func(t *testing.T) error {
+			return searchFake(t, fakePostgres(t, nil, nil), 300*time.Millisecond)
+		}, true},
+
+		// Network level or not about load: the API on port 443 may still answer.
+		{"port refused", func(t *testing.T) error { return searchFake(t, closedPort(t), 5*time.Second) }, false},
+		{"dial timeout", func(t *testing.T) error { return searchFake(t, silentPort(t), 5*time.Second) }, false},
+		{"tls verification", func(*testing.T) error {
+			return fmt.Errorf("crt.sh db: %w", &tls.CertificateVerificationError{Err: errors.New("bad chain")})
+		}, false},
+		{"schema changed", func(t *testing.T) error {
+			return searchFake(t, fakePostgres(t, nil, pgErr("42P01", `relation "certificate" does not exist`)), 5*time.Second)
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.err(t)
+			reason, ok := CrtShDB{}.overloaded(err)
+			if ok != tt.overloaded {
+				t.Fatalf("overloaded = %v (%q), want %v: %v", ok, reason, tt.overloaded, err)
+			}
+			if ok && reason == "" {
+				t.Error("no reason given")
 			}
 		})
 	}

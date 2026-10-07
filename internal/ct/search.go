@@ -25,6 +25,8 @@ type CrtSh struct {
 
 func (CrtSh) Name() string { return "crtsh" }
 
+func (CrtSh) backend() string { return crtshDBHost }
+
 type crtshRow struct {
 	ID         int64  `json:"id"`
 	IssuerName string `json:"issuer_name"`
@@ -198,7 +200,9 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 	return certs, nil
 }
 
-// Auto tries each source in order and returns the first answer.
+// Auto tries each source in order and returns the first answer. When a source
+// reports that its backend is overloaded, later sources on the same backend are
+// skipped: they would wait just as long and fail the same way.
 type Auto struct {
 	Sources []Searcher
 	Warn    io.Writer
@@ -206,18 +210,45 @@ type Auto struct {
 
 func (Auto) Name() string { return "auto" }
 
+// sharedBackend is a source that queries a backend other sources may also use.
+type sharedBackend interface{ backend() string }
+
+// overloadDetector is a source that can tell from its own error that its
+// backend gave up, as opposed to the network failing on the way there.
+type overloadDetector interface {
+	sharedBackend
+	overloaded(err error) (reason string, ok bool)
+}
+
+func backendOf(s Searcher) string {
+	if b, ok := s.(sharedBackend); ok {
+		return b.backend()
+	}
+	return ""
+}
+
 func (a Auto) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
 	var err error
+	var down, why string // a backend that failed on the server side, and what the source said
 	actx := withSource(ctx, a.Name())
-	for i, s := range a.Sources {
+	for i := 0; i < len(a.Sources); {
+		s := a.Sources[i]
 		Trace(actx, LevelInfo, "trying %s", s.Name())
 		var certs []Certificate
 		certs, err = s.Search(ctx, domain, subdomains, includeExpired)
 		if err == nil || ctx.Err() != nil {
 			return certs, err
 		}
-		if i+1 < len(a.Sources) {
-			searchWarnf(actx, a.Warn, "%v; falling back to %s", err, a.Sources[i+1].Name())
+		if d, ok := s.(overloadDetector); ok {
+			if reason, ok := d.overloaded(err); ok {
+				down, why = d.backend(), s.Name()+" failed on "+d.backend()+"'s side ("+reason+")"
+			}
+		}
+		for i++; i < len(a.Sources) && down != "" && backendOf(a.Sources[i]) == down; i++ {
+			searchWarnf(actx, a.Warn, "skipping %s: %s, and %s uses the same database", a.Sources[i].Name(), why, a.Sources[i].Name())
+		}
+		if i < len(a.Sources) {
+			searchWarnf(actx, a.Warn, "%v; falling back to %s", err, a.Sources[i].Name())
 		}
 	}
 	return nil, err
