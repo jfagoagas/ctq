@@ -38,8 +38,10 @@ type WatchHooks struct {
 type Options struct {
 	Domain     string // initial domain; empty opens the domain prompt
 	Subdomains bool
-	Source     string // auto | crtsh-db | crtsh | certspotter
-	Watch      bool   // start tailing logs immediately
+	Expired    bool          // history includes expired certificates; only part of the cache key
+	Source     string        // auto | crtsh-db | crtsh | certspotter
+	Watch      bool          // start tailing logs immediately
+	CacheTTL   time.Duration // how long a search result is reused; 0 disables the cache
 	Backend    Backend
 }
 
@@ -143,6 +145,11 @@ type Model struct {
 	searchCancel context.CancelFunc
 	searchErr    error
 	searchTook   time.Duration
+	searchKey    searchKey // what the in-flight search is for, so its result is cached under it
+
+	cache     *searchCache
+	fromCache bool      // the history on screen came from the cache, not a fresh search
+	resultAt  time.Time // when the history on screen was fetched
 
 	watching     bool
 	watchStarted time.Time
@@ -184,6 +191,7 @@ func New(ctx context.Context, o Options) *Model {
 		names:      map[string]*nameStat{},
 		source:     src,
 		liveWanted: o.Watch,
+		cache:      newSearchCache(o.CacheTTL),
 		sink:       newSink(),
 		matches:    make(chan matchMsg, 256),
 	}
@@ -194,7 +202,7 @@ func (m *Model) Init() tea.Cmd {
 	if m.domain == "" {
 		return tea.Batch(append(cmds, m.openDomainPrompt())...)
 	}
-	cmds = append(cmds, m.startSearch())
+	cmds = append(cmds, m.search())
 	if m.liveWanted {
 		cmds = append(cmds, m.startWatch())
 	}
@@ -211,6 +219,38 @@ func waitMatch(ch <-chan matchMsg) tea.Cmd {
 	return func() tea.Msg { return <-ch }
 }
 
+func (m *Model) currentKey() searchKey {
+	return searchKey{domain: m.domain, source: m.source, subdomains: m.opts.Subdomains, expired: m.opts.Expired}
+}
+
+// search shows the cached answer for the current domain and source when there is a
+// fresh one, and otherwise runs the search. r calls startSearch directly to skip the cache.
+func (m *Model) search() tea.Cmd {
+	k := m.currentKey()
+	e, ok := m.cache.get(k, m.now())
+	if !ok {
+		return m.startSearch()
+	}
+	// Supersede any search still running for the previous domain or source.
+	if m.searchCancel != nil {
+		m.searchCancel()
+		m.searchCancel = nil
+	}
+	m.searchGen++
+	m.searching, m.searchErr, m.searchTook = false, nil, e.took
+	m.sink.trace("search", ct.LevelInfo, fmt.Sprintf("%s via %s: %s from the cache, fetched %s (r to refresh)",
+		k.domain, k.source, plural(len(e.certs), "certificate"), ago(m.now().Sub(e.at))))
+	m.showHistory(e.certs, true, e.at)
+	return nil
+}
+
+func (m *Model) showHistory(certs []ct.Certificate, cached bool, at time.Time) {
+	m.searched, m.history, m.fromCache, m.resultAt = true, certs, cached, at
+	m.rebuildNames()
+	m.refresh()
+}
+
+// startSearch always queries the backend.
 func (m *Model) startSearch() tea.Cmd {
 	if m.searchCancel != nil {
 		m.searchCancel()
@@ -218,6 +258,7 @@ func (m *Model) startSearch() tea.Cmd {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.searchCancel = cancel
 	m.searchGen++
+	m.searchKey = m.currentKey()
 	gen, domain, src, search, warn := m.searchGen, m.domain, m.source, m.opts.Backend.Search, m.sink
 	m.searching, m.searchErr = true, nil
 	trace := m.sink.trace
@@ -283,14 +324,14 @@ func (m *Model) switchDomain(d string) tea.Cmd {
 	m.watchGen++
 
 	m.domain = d
-	m.history, m.live, m.unseen, m.searched = nil, nil, 0, false
+	m.history, m.live, m.unseen, m.searched, m.fromCache = nil, nil, 0, false, false
 	m.searchErr, m.watchErr = nil, nil
 	m.filter.SetValue("")
 	m.detail = false
 	m.rebuildNames()
 	m.table.GotoTop()
 
-	cmds := []tea.Cmd{m.startSearch()}
+	cmds := []tea.Cmd{m.search()}
 	if m.liveWanted {
 		cmds = append(cmds, m.startWatch())
 	}
@@ -313,13 +354,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // superseded by a newer search
 		}
 		m.searching, m.searchErr, m.searchTook = false, msg.err, msg.took
-		if msg.err == nil {
-			m.searched = true
-			sort.Slice(msg.certs, func(i, j int) bool { return msg.certs[i].NotBefore.After(msg.certs[j].NotBefore) })
-			m.history = msg.certs
-			m.rebuildNames()
+		if msg.err != nil {
+			m.refresh()
+			return m, nil
 		}
-		m.refresh()
+		sort.Slice(msg.certs, func(i, j int) bool { return msg.certs[i].NotBefore.After(msg.certs[j].NotBefore) })
+		at := m.now()
+		m.cache.put(m.searchKey, cacheEntry{certs: msg.certs, at: at, took: msg.took})
+		m.showHistory(msg.certs, false, at)
 		return m, nil
 
 	case matchMsg:
@@ -448,7 +490,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		return m, m.openDomainPrompt()
 	case "r":
-		return m, m.startSearch()
+		return m, m.startSearch() // always fresh: r is how the user asks past the cache
 	case "s":
 		for i, s := range sources {
 			if s == m.source {
@@ -456,7 +498,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		return m, m.startSearch()
+		return m, m.search()
 	case "w":
 		m.liveWanted = !m.watching
 		if m.watching {

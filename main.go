@@ -312,6 +312,7 @@ func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	interval := fs.Duration("interval", 15*time.Second, "poll interval per log")
 	workers := fs.Int("workers", 4, "concurrent fetches per log")
 	statePath := fs.String("state", "", "file to persist log offsets; resumes from it on restart")
+	cacheTTL := fs.Duration("cache-ttl", 15*time.Minute, "reuse a search result this long when switching sources or domains (r always searches again); 0 disables")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -336,8 +337,10 @@ func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	model := tui.New(ctx, tui.Options{
 		Domain:     domain,
 		Subdomains: !*exact,
+		Expired:    *expired,
 		Source:     *source,
 		Watch:      !*noLive,
+		CacheTTL:   *cacheTTL,
 		Backend: tui.Backend{
 			Search: func(ctx context.Context, domain, source string, warn io.Writer) ([]ct.Certificate, error) {
 				s, err := newSearcher(source, *timeout, warn)
