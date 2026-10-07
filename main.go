@@ -138,6 +138,10 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 func newSearcher(source string, timeout time.Duration, warn io.Writer) (ct.Searcher, error) {
 	spotter := ct.CertSpotter{Client: ct.NewClient(timeout, 2), APIKey: os.Getenv("CERTSPOTTER_API_KEY"), Warn: warn}
+	if spotter.APIKey != "" {
+		// A paid key is limited by its quota, not the page count: a 429 ends the search instead.
+		spotter.MaxPages = ct.CertSpotterKeyedMaxPages
+	}
 	// The guest pool queues every statement for about a minute before running it, and
 	// crt.sh often refuses connections for tens of seconds: 4 retries back off for 75s.
 	db := ct.CrtShDB{Timeout: max(timeout, 3*time.Minute), Retries: 4, Backoff: 5 * time.Second, Warn: warn}

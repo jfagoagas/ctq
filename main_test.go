@@ -59,3 +59,20 @@ func TestNewSearcherAutoOrder(t *testing.T) {
 		t.Error("accepted an unknown source")
 	}
 }
+
+func TestNewSearcherCertSpotterPageCap(t *testing.T) {
+	t.Setenv("CERTSPOTTER_API_KEY", "")
+	s, _ := newSearcher("certspotter", time.Minute, nil)
+	if got := s.(ct.CertSpotter).MaxPages; got != 0 {
+		t.Errorf("without a key MaxPages = %d, want the default", got)
+	}
+	t.Setenv("CERTSPOTTER_API_KEY", "k")
+	s, _ = newSearcher("certspotter", time.Minute, nil)
+	if got := s.(ct.CertSpotter).MaxPages; got != ct.CertSpotterKeyedMaxPages {
+		t.Errorf("with a key MaxPages = %d, want %d", got, ct.CertSpotterKeyedMaxPages)
+	}
+	auto, _ := newSearcher("auto", time.Minute, nil)
+	if got := auto.(ct.Auto).Sources[2].(ct.CertSpotter).MaxPages; got != ct.CertSpotterKeyedMaxPages {
+		t.Errorf("auto: with a key MaxPages = %d, want %d", got, ct.CertSpotterKeyedMaxPages)
+	}
+}

@@ -3,8 +3,10 @@ package ct
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -93,8 +95,18 @@ func splitLines(s string) []string {
 	return out
 }
 
+// Page caps for CertSpotter.MaxPages. Each page is one query against the quota:
+// without a key the free plan allows 10 per hour, so more than 20 pages is moot.
+// With a paid key the quota is what limits a search, and a 429 ends it early with
+// partial results. The keyed cap only guards against a cursor that never ends.
+const (
+	CertSpotterMaxPages      = 20
+	CertSpotterKeyedMaxPages = 1000
+)
+
 // CertSpotter queries SSLMate's Cert Spotter API. Reliable and paginated, but
 // 10 requests/hour without an API key, and it only returns unexpired certificates.
+// MaxPages defaults to CertSpotterMaxPages.
 type CertSpotter struct {
 	Client   *Client
 	BaseURL  string
@@ -143,7 +155,7 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 	}
 	maxPages := s.MaxPages
 	if maxPages <= 0 {
-		maxPages = 20
+		maxPages = CertSpotterMaxPages
 	}
 	q := url.Values{
 		"domain":             {domain},
@@ -157,6 +169,7 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 	} else {
 		Trace(ctx, LevelInfo, "no API key: the free quota is 10 full-domain queries per hour")
 	}
+	Trace(ctx, LevelInfo, "paginating up to %d pages", maxPages)
 
 	var certs []Certificate
 	for page := 0; page < maxPages; page++ {
@@ -164,6 +177,11 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 		if err != nil {
 			if page > 0 && ctx.Err() == nil {
 				// Partial results beat none: page 1 alone is often enough for small domains.
+				var herr *HTTPError
+				if errors.As(err, &herr) && herr.Code == http.StatusTooManyRequests {
+					searchWarnf(ctx, s.Warn, "certspotter: rate limited on page %d, results are incomplete: %v", page+1, err)
+					return certs, nil
+				}
 				searchWarnf(ctx, s.Warn, "certspotter: page %d failed, results are incomplete: %v", page+1, err)
 				return certs, nil
 			}
