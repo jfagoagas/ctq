@@ -68,7 +68,8 @@ func (r *tlsReader) uint(n int) uint64 {
 }
 
 // vec reads a variable-length vector whose length prefix is lenBytes wide.
-func (r *tlsReader) vec(lenBytes int) []byte { return r.bytes(int(r.uint(lenBytes))) }
+// Prefixes are at most 3 bytes, and bytes() rejects a negative n anyway.
+func (r *tlsReader) vec(lenBytes int) []byte { return r.bytes(int(r.uint(lenBytes))) } //nolint:gosec // G115, see above
 
 // --- RFC 6962 ---
 

@@ -245,6 +245,15 @@ CTQ_LIVE=1 go test -run TestLive -v ./internal/ct/   # checks parsing against re
 
 Unit tests use local HTTP servers and fakes; nothing touches the network unless `CTQ_LIVE` is set.
 
+### Lint and secret scanning
+
+CI lints every pull request with [golangci-lint](https://golangci-lint.run/) v2 (config in `.golangci.yml`, including gofmt and goimports) and scans its commits for secrets with [trufflehog](https://github.com/trufflesecurity/trufflehog). To run the same checks locally:
+
+```sh
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+trufflehog git file://. --since-commit main --results=verified,unknown --fail
+```
+
 The README screenshots and the demo GIF are made with [vhs](https://github.com/charmbracelet/vhs) from the tapes in `docs/screenshots/`. They run a real search, so they need network access and take a few minutes:
 
 ```sh
