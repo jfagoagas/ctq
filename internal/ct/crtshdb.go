@@ -13,9 +13,11 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CrtShDB queries crt.sh's public Postgres directly. It returns the full history
@@ -27,6 +29,10 @@ type CrtShDB struct {
 	Retries int           // reconnects when the pool refuses clients
 	Backoff time.Duration
 	Warn    io.Writer
+
+	// Tests replace these; nil means pgx.ConnectConfig and time.After.
+	dial  func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error)
+	after func(time.Duration) <-chan time.Time
 }
 
 func (CrtShDB) Name() string { return "crtsh-db" }
@@ -95,12 +101,19 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	dial, after := s.dial, s.after
+	if dial == nil {
+		dial = pgx.ConnectConfig
+	}
+	if after == nil {
+		after = time.After
+	}
 	var last error
 	timeouts := 0
 	for attempt := 0; attempt <= s.Retries; attempt++ {
 		Trace(ctx, LevelInfo, "connecting to %s:5432 (attempt %d of %d)", crtshDBHost, attempt+1, s.Retries+1)
 		start := time.Now()
-		conn, err := pgx.ConnectConfig(ctx, cfg)
+		conn, err := dial(ctx, cfg)
 		if err == nil {
 			Trace(ctx, LevelInfo, "connected in %s", since(start))
 			return conn, nil
@@ -130,7 +143,7 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 		select {
 		case <-ctx.Done():
 			return nil, last
-		case <-time.After(delay):
+		case <-after(delay):
 		}
 	}
 	return nil, fmt.Errorf("giving up after %d attempts: %w", s.Retries+1, last)
@@ -158,6 +171,35 @@ func classifyConnErr(err error) connErrKind {
 		return connTimeout
 	}
 	return connRetry
+}
+
+// backend is crt.sh's database, which the JSON API (CrtSh) queries too.
+func (CrtShDB) backend() string { return crtshDBHost }
+
+// overloaded reports whether err shows that crt.sh itself gave up: its pooler or
+// Postgres answered with an error, or the query was accepted and still had no
+// answer when the timeout expired. The JSON API runs on the same database, so it
+// would fail the same way. A refused or silent port 5432 and TLS failures are not
+// overload: they can be this network, and the API on port 443 may still answer.
+func (CrtShDB) overloaded(err error) (reason string, ok bool) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Code == "57014": // query_canceled: statement_timeout
+			return "crt.sh cancelled the query: " + pgErr.Message, true
+		case pgErr.Code == "08P01", // PgBouncer's code for max_client_conn, query_wait_timeout and the like
+			strings.HasPrefix(pgErr.Code, "53"),                                 // insufficient_resources, including too_many_connections
+			pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03": // shutting down or starting up
+			return "crt.sh refused the work: " + pgErr.Message, true
+		}
+		return "", false
+	}
+	var connErr *pgconn.ConnectError
+	if !errors.As(err, &connErr) && classifyConnErr(err) == connTimeout {
+		// Connected, so port 5432 is reachable: the time went to crt.sh's queue or the query.
+		return "the query got no answer before the timeout", true
+	}
+	return "", false
 }
 
 // crtshDBConfig pins every connection setting. pgx.ParseConfig always merges PG*
