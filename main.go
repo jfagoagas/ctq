@@ -223,6 +223,11 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
+	// A failed write to stdout (closed pipe, full disk) stops the watch with that
+	// error as the cause, so ctq exits 1 instead of tailing logs into the void.
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+
 	w, err := newWatcher(ctx, watchConfig{
 		domain: domain, subdomains: !*exact, interval: *interval, workers: *workers,
 		statePath: *statePath, logFilter: *logFilter, warn: stderr,
@@ -242,7 +247,10 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	w.Verbose = *verbose
 	w.Emit = func(m ct.Match) {
 		if *asJSON {
-			enc.Encode(m)
+			// Emit calls are serialized (Watcher.emitMu), and stop is idempotent.
+			if err := enc.Encode(m); err != nil {
+				stop(fmt.Errorf("writing JSON to stdout: %w", err))
+			}
 			return
 		}
 		kind := "cert   "
@@ -252,7 +260,12 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		fmt.Fprintf(stdout, "%s  %s  %-24s  %s  [%s]\n", time.Now().UTC().Format(time.RFC3339), kind,
 			ct.IssuerCN(m.Issuer), strings.Join(m.DNSNames, ","), m.Log)
 	}
-	return w.Run(ctx)
+	err = w.Run(ctx)
+	// Ctrl-C cancels the parent context, whose cause is context.Canceled: exit 0.
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return err
 }
 
 type watchConfig struct {
