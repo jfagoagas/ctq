@@ -8,13 +8,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,10 +148,11 @@ func TestFromDBRows(t *testing.T) {
 		{id: 50, der: []byte("not a certificate")},
 	}
 
-	certs, skipped := fromDBRows(rows, "example.com", true, false, now)
-	if skipped != 1 {
-		t.Errorf("skipped = %d, want 1", skipped)
+	parsed, failed := parseDBRows(context.Background(), rows)
+	if !slices.Equal(failed, []int64{50}) {
+		t.Errorf("failed = %v, want [50]", failed)
 	}
+	certs := scopeDBCerts(parsed, "example.com", true, false, now)
 	if len(certs) != 1 {
 		t.Fatalf("certs = %+v", certs)
 	}
@@ -156,14 +161,115 @@ func TestFromDBRows(t *testing.T) {
 		t.Errorf("cert = %+v", c)
 	}
 
-	certs, _ = fromDBRows(rows, "example.com", true, true, now)
+	certs = scopeDBCerts(parsed, "example.com", true, true, now)
 	if len(certs) != 2 {
 		t.Errorf("with expired: %d certs, want 2", len(certs))
 	}
 
-	certs, _ = fromDBRows(rows, "example.com", false, true, now)
+	certs = scopeDBCerts(parsed, "example.com", false, true, now)
 	if len(certs) != 1 || len(certs[0].DNSNames) != 1 || certs[0].DNSNames[0] != "example.com" {
 		t.Errorf("exact: %+v", certs)
+	}
+}
+
+func readPEM(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := pem.Decode(b)
+	if p == nil {
+		t.Fatalf("%s: no PEM block", name)
+	}
+	return p.Bytes
+}
+
+func mustHex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// crt.sh ids 2854374595, 2854374664 and 2854376823 are copies of the example.org
+// certificate 987119772 with the outer signature algorithm swapped for a private
+// OID (1.3.6.1.4.1.46450.5.123.4.x). The TBS is byte-identical, so Go rejects
+// them while crt.sh indexes them under example.com.
+func TestFallbackForRejectedCert(t *testing.T) {
+	tampered := dbRow{id: 2854374664, der: readPEM(t, "crtsh-2854374664.pem")}
+	orig := dbRow{id: 987119772, der: readPEM(t, "crtsh-987119772.pem")}
+
+	if _, err := x509.ParseCertificate(tampered.der); err == nil || !strings.Contains(err.Error(), "signature algorithm") {
+		t.Fatalf("fixture no longer exercises the fallback: err = %v", err)
+	}
+	parsed, failed := parseDBRows(context.Background(), []dbRow{tampered, orig})
+	if len(parsed) != 1 || parsed[0].id != orig.id || !slices.Equal(failed, []int64{tampered.id}) {
+		t.Fatalf("parsed = %+v, failed = %v", parsed, failed)
+	}
+
+	// What crtshDBFallbackQuery returned for 2854374664 on 2026-10-06.
+	nb := time.Date(2018, 11, 28, 0, 0, 0, 0, time.UTC)
+	na := time.Date(2020, 12, 2, 12, 0, 0, 0, time.UTC)
+	issuerName := "C=US, O=DigiCert Inc, CN=DigiCert SHA2 Secure Server CA"
+	row := dbFallbackRow{
+		id:         tampered.id,
+		issuerDER:  mustHex(t, "304d310b300906035504061302555331153013060355040a130c446967694365727420496e63312730250603550403131e446967694365727420534841322053656375726520536572766572204341"),
+		issuerName: &issuerName,
+		serial:     mustHex(t, "0fd078dd48f1a2bd4d0f2ba96b6038fe"),
+		notBefore:  &nb,
+		notAfter:   &na,
+		names:      []string{"www.example.org", "example.com", "example.edu", "example.net", "example.org", "www.example.com", "www.example.edu", "www.example.net", "www.example.org"},
+	}
+	fb, ok := row.cert()
+	if !ok {
+		t.Fatal("readable fallback row rejected")
+	}
+	if fb.key != parsed[0].key {
+		t.Error("crt.sh's issuer and serial don't match Go's: tampered copies would not deduplicate")
+	}
+
+	// On its own the rejected row reaches History and Names, formatted like a parsed row.
+	certs := scopeDBCerts([]dbCert{fb}, "example.com", true, true, time.Now())
+	want := Certificate{
+		ID: "2854374664", Source: "crtsh-db", Issuer: "CN=DigiCert SHA2 Secure Server CA,O=DigiCert Inc,C=US",
+		DNSNames: []string{"example.com", "www.example.com"}, NotBefore: nb, NotAfter: na,
+	}
+	if len(certs) != 1 || !reflect.DeepEqual(certs[0], want) {
+		t.Errorf("fallback only:\n got %+v\nwant %+v", certs, want)
+	}
+	if got := scopeDBCerts(parsed, "example.com", true, true, time.Now()); !reflect.DeepEqual(got[0], Certificate{
+		ID: "987119772", Source: "crtsh-db", Issuer: want.Issuer, DNSNames: want.DNSNames, NotBefore: nb, NotAfter: na,
+	}) {
+		t.Errorf("parsed row differs from its fallback twin: %+v", got)
+	}
+
+	// Next to the real certificate, the copy collapses into it.
+	certs = scopeDBCerts(append(slices.Clone(parsed), fb), "example.com", true, true, time.Now())
+	if len(certs) != 1 || certs[0].ID != "987119772" {
+		t.Errorf("with the real certificate: %+v", certs)
+	}
+
+	// Without a parseable issuer DN, crt.sh's text is used.
+	noDN := row
+	noDN.issuerDER = []byte{0x30, 0x03, 0x02, 0x01, 0x01}
+	if c, ok := noDN.cert(); !ok || c.issuer != issuerName {
+		t.Errorf("issuer = %q, ok = %v", c.issuer, ok)
+	}
+
+	// Rows crt.sh can't read either stay skipped.
+	for name, mutate := range map[string]func(*dbFallbackRow){
+		"no dates":  func(r *dbFallbackRow) { r.notBefore, r.notAfter = nil, nil },
+		"no issuer": func(r *dbFallbackRow) { r.issuerDER = nil },
+		"no serial": func(r *dbFallbackRow) { r.serial = nil },
+	} {
+		r := row
+		mutate(&r)
+		if _, ok := r.cert(); ok {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
 

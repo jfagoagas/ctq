@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"slices"
 	"strconv"
@@ -88,7 +91,22 @@ func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeE
 	}
 	Trace(ctx, LevelInfo, "%d rows in %s", len(raw), since(start))
 
-	certs, skipped := fromDBRows(raw, domain, subdomains, includeExpired, time.Now())
+	parsed, failed := parseDBRows(ctx, raw)
+	skipped := len(failed)
+	if len(failed) > 0 {
+		Trace(ctx, LevelInfo, "asking crt.sh's parser for the %d rows Go rejected; the statement queues again", len(failed))
+		start := time.Now()
+		read, err := readUnparsed(ctx, conn, failed)
+		if err != nil {
+			Trace(ctx, LevelWarn, "fallback query failed after %s: %v", since(start), err)
+		} else {
+			Trace(ctx, LevelInfo, "crt.sh read %d of %d rejected rows in %s", len(read), len(failed), since(start))
+			parsed = append(parsed, read...)
+			skipped -= len(read)
+		}
+	}
+
+	certs := scopeDBCerts(parsed, domain, subdomains, includeExpired, time.Now())
 	if skipped > 0 {
 		searchWarnf(ctx, s.Warn, "crt.sh db: skipped %d certificates that could not be parsed", skipped)
 	}
@@ -271,28 +289,140 @@ func spkiSHA256(c *x509.Certificate) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// fromDBRows parses and scopes rows. crt.sh stores a precertificate and its final
-// certificate as two rows; like the JSON API's deduplicate=Y, only the first by id
-// is kept per issuer and serial. skipped counts DER that Go refuses to parse.
-func fromDBRows(rows []dbRow, domain string, subdomains, includeExpired bool, now time.Time) (certs []Certificate, skipped int) {
-	slices.SortFunc(rows, func(a, b dbRow) int { return cmp.Compare(a.id, b.id) })
-	seen := make(map[string]bool, len(rows))
+// dbCert is one row as read by Go's parser or by crt.sh's, before deduplication and scoping.
+type dbCert struct {
+	id                  int64
+	key                 string // issuer and serial, see dbKey
+	issuer              string
+	names               []string // SANs and subject CN, unscoped
+	notBefore, notAfter time.Time
+}
+
+// dbKey identifies a certificate across rows: a precertificate and its final
+// certificate share it, and so do copies whose outer signature was tampered with.
+func dbKey(rawIssuer []byte, serial *big.Int) string {
+	return string(rawIssuer) + "/" + serial.String()
+}
+
+// parseDBRows parses the DER of each row. Rows Go rejects are returned in failed
+// for readUnparsed. Go is stricter than CAs have been (malformed strings and
+// extensions, negative serials, mismatched signature algorithms), and crt.sh logs it all.
+func parseDBRows(ctx context.Context, rows []dbRow) (certs []dbCert, failed []int64) {
 	for _, r := range rows {
 		x, err := x509.ParseCertificate(r.der)
 		if err != nil {
-			skipped++
+			Trace(ctx, LevelWarn, "crt.sh id %d: %v", r.id, err)
+			failed = append(failed, r.id)
 			continue
 		}
-		key := string(x.RawIssuer) + "/" + x.SerialNumber.String()
-		if seen[key] {
+		certs = append(certs, dbCert{
+			id:        r.id,
+			key:       dbKey(x.RawIssuer, x.SerialNumber),
+			issuer:    x.Issuer.String(),
+			names:     slices.Concat(x.DNSNames, []string{x.Subject.CommonName}),
+			notBefore: x.NotBefore,
+			notAfter:  x.NotAfter,
+		})
+	}
+	return certs, failed
+}
+
+// crtshDBFallbackQuery reads rows Go rejects with crt.sh's own parser (OpenSSL,
+// through libx509pq), which also feeds the JSON API. x509_name(..., FALSE) is the
+// issuer DER and x509_serialNumber the serial's bytes: the same values as Go's
+// RawIssuer and SerialNumber, so these rows deduplicate against parsed ones.
+// Type 2 is GEN_DNS. $1 is cast because the simple protocol sends it as text.
+const crtshDBFallbackQuery = `SELECT c.id, x509_name(c.certificate, FALSE), x509_issuerName(c.certificate),
+	x509_serialNumber(c.certificate), x509_notBefore(c.certificate), x509_notAfter(c.certificate),
+	array_remove(ARRAY(SELECT x509_altNames(c.certificate, 2)) || x509_commonName(c.certificate), NULL)
+FROM certificate c WHERE c.id = ANY($1::bigint[])`
+
+type dbFallbackRow struct {
+	id                  int64
+	issuerDER, serial   []byte
+	issuerName          *string
+	notBefore, notAfter *time.Time
+	names               []string
+}
+
+// readUnparsed asks crt.sh for the names and dates of the rows in ids. It is a
+// second statement, so it waits in the pool's queue again; it only runs when Go
+// rejected something. Rows crt.sh can't read either are left out.
+func readUnparsed(ctx context.Context, conn *pgx.Conn, ids []int64) ([]dbCert, error) {
+	rows, err := conn.Query(ctx, crtshDBFallbackQuery, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var certs []dbCert
+	for rows.Next() {
+		var r dbFallbackRow
+		if err := rows.Scan(&r.id, &r.issuerDER, &r.issuerName, &r.serial, &r.notBefore, &r.notAfter, &r.names); err != nil {
+			return nil, err
+		}
+		if c, ok := r.cert(); ok {
+			certs = append(certs, c)
+		} else {
+			Trace(ctx, LevelWarn, "crt.sh id %d: crt.sh's parser can't read it either", r.id)
+		}
+	}
+	return certs, rows.Err()
+}
+
+func (r dbFallbackRow) cert() (dbCert, bool) {
+	if len(r.issuerDER) == 0 || len(r.serial) == 0 || r.notBefore == nil || r.notAfter == nil {
+		return dbCert{}, false
+	}
+	// Format the issuer the way Go does for parsed rows; crt.sh's own text is the fallback.
+	var issuer string
+	var rdn pkix.RDNSequence
+	if rest, err := asn1.Unmarshal(r.issuerDER, &rdn); err == nil && len(rest) == 0 {
+		var n pkix.Name
+		n.FillFromRDNSequence(&rdn)
+		issuer = n.String()
+	} else if r.issuerName != nil {
+		issuer = *r.issuerName
+	}
+	return dbCert{
+		id: r.id,
+		// Go rejects negative serials, so only these rows can have one and
+		// reading the bytes as unsigned keeps their keys consistent.
+		key:       dbKey(r.issuerDER, new(big.Int).SetBytes(r.serial)),
+		issuer:    issuer,
+		names:     r.names,
+		notBefore: *r.notBefore,
+		notAfter:  *r.notAfter,
+	}, true
+}
+
+// scopeDBCerts deduplicates and scopes rows. crt.sh stores a precertificate and
+// its final certificate as two rows; like the JSON API's deduplicate=Y, only the
+// first by id is kept per issuer and serial.
+func scopeDBCerts(rows []dbCert, domain string, subdomains, includeExpired bool, now time.Time) []Certificate {
+	slices.SortFunc(rows, func(a, b dbCert) int { return cmp.Compare(a.id, b.id) })
+	seen := make(map[string]bool, len(rows))
+	var certs []Certificate
+	for _, r := range rows {
+		if seen[r.key] {
 			continue
 		}
-		seen[key] = true
-		c, ok := fromX509(strconv.FormatInt(r.id, 10), "crtsh-db", x, domain, subdomains)
-		if !ok || (!includeExpired && c.Expired(now)) {
+		seen[r.key] = true
+		names := Scope(r.names, domain, subdomains)
+		if len(names) == 0 {
+			continue
+		}
+		c := Certificate{
+			ID:        strconv.FormatInt(r.id, 10),
+			Source:    "crtsh-db",
+			Issuer:    r.issuer,
+			DNSNames:  names,
+			NotBefore: r.notBefore.UTC(),
+			NotAfter:  r.notAfter.UTC(),
+		}
+		if !includeExpired && c.Expired(now) {
 			continue
 		}
 		certs = append(certs, c)
 	}
-	return certs, skipped
+	return certs
 }
