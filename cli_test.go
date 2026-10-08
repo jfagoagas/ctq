@@ -503,6 +503,27 @@ func TestWatchJSON(t *testing.T) {
 	}
 }
 
+type brokenWriter struct{}
+
+func (brokenWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// A JSON consumer that goes away (ctq watch -json | head -1) must end the watch
+// with exit 1, not leave it tailing logs with nowhere to write.
+func TestWatchJSONStdoutBroken(t *testing.T) {
+	statePath := watchSetup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var errOut syncBuffer
+	code := run(ctx, []string{"watch", "-json", "-state", statePath, "-log", "test", "-interval", "20ms", "example.com"},
+		brokenWriter{}, &errOut)
+	if code != 1 || !strings.Contains(errOut.String(), "ctq: writing JSON to stdout: broken pipe") {
+		t.Errorf("exit %d stderr %q, want exit 1 and the write error", code, errOut.String())
+	}
+	if ctx.Err() != nil {
+		t.Error("the watch ran until the test timeout instead of stopping on the write error")
+	}
+}
+
 func TestWatchErrors(t *testing.T) {
 	t.Run("log list unreachable", func(t *testing.T) {
 		stubLogs(t, nil, errors.New("giving up after 4 attempts"))

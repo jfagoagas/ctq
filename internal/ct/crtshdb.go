@@ -222,7 +222,7 @@ func crtshDBConfig() (*pgx.ConnConfig, error) {
 		ServerName: crtshDBHost,
 		MinVersion: tls.VersionTLS12,
 		// Not a skip: VerifyConnection below does the full chain and hostname check.
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, //nolint:gosec // G402: VerifyConnection verifies chain, hostname and the expired-key pin (#9)
 		VerifyConnection:   verifyWithExpiredPin(crtshDBHost, nil, crtshDBExpiredKeyPin),
 	}
 	cfg.RuntimeParams = map[string]string{"application_name": UserAgent}
