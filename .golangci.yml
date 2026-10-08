@@ -63,19 +63,6 @@ linters:
           - gosec
           - errcheck
           - noctx
-      # Reviewed false positive: VerifyConnection does the full chain and
-      # hostname check (with an expired-key pin). TODO: replace with an inline
-      # //nolint once the open crtshdb.go branches merge.
-      - path: internal/ct/crtshdb\.go
-        linters:
-          - gosec
-        text: "G402: TLS InsecureSkipVerify set to true"
-      # TODO: real finding, the JSON encode error to stdout is dropped. Kept out
-      # of the way only until the open main.go branches merge; fix and delete.
-      - path: ^main\.go$
-        linters:
-          - errcheck
-        text: "Error return value of `enc.Encode` is not checked"
 
 formatters:
   enable:
