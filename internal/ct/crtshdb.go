@@ -36,6 +36,8 @@ type CrtShDB struct {
 	// Tests replace these; nil means pgx.ConnectConfig and time.After.
 	dial  func(context.Context, *pgx.ConnConfig) (*pgx.Conn, error)
 	after func(time.Duration) <-chan time.Time
+	// Zero means crtshDBMaxRows and crtshDBMaxBytes.
+	maxRows, maxBytes int
 }
 
 func (CrtShDB) Name() string { return "crtsh-db" }
@@ -50,6 +52,43 @@ const crtshDBQuery = `SELECT c.id, c.certificate FROM certificate c WHERE plaint
 type dbRow struct {
 	id  int64
 	der []byte
+}
+
+// Caps on what one search holds in memory. The HTTP client stops at 64 MiB; rows
+// here are kept as DER and parsed after the scan, so the cap is on that. A
+// certificate is 1-2 KiB of DER, and busy domains with years of history have tens
+// of thousands of rows, so 500k rows or 256 MiB leaves an order of magnitude of
+// headroom. Shared hosting suffixes (github.io, herokuapp.com) have millions.
+const (
+	crtshDBMaxRows  = 500_000
+	crtshDBMaxBytes = 256 << 20
+)
+
+// rowScanner is the part of pgx.Rows that collectRows uses.
+type rowScanner interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+// collectRows reads (id, DER) rows and fails as soon as either cap is passed,
+// leaving the caller to stop the query. Zero caps mean the defaults.
+func collectRows(rows rowScanner, maxRows, maxBytes int) ([]dbRow, error) {
+	maxRows, maxBytes = cmp.Or(maxRows, crtshDBMaxRows), cmp.Or(maxBytes, crtshDBMaxBytes)
+	var raw []dbRow
+	size := 0
+	for rows.Next() {
+		var r dbRow
+		if err := rows.Scan(&r.id, &r.der); err != nil {
+			return nil, err
+		}
+		size += len(r.der)
+		if len(raw) == maxRows || size > maxBytes {
+			return nil, fmt.Errorf("more than %d certificates or %d MiB match; search a narrower domain, or use -source certspotter", maxRows, maxBytes>>20)
+		}
+		raw = append(raw, r)
+	}
+	return raw, rows.Err()
 }
 
 func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeExpired bool) ([]Certificate, error) {
@@ -71,21 +110,18 @@ func (s CrtShDB) Search(ctx context.Context, domain string, subdomains, includeE
 
 	Trace(ctx, LevelInfo, "query sent; crt.sh's shared pool queues it (often 45s or more), then it runs")
 	start := time.Now()
-	rows, err := conn.Query(ctx, crtshDBQuery, domain)
+	qctx, stopQuery := context.WithCancel(ctx)
+	defer stopQuery()
+	rows, err := conn.Query(qctx, crtshDBQuery, domain)
 	if err != nil {
 		Trace(ctx, LevelError, "query failed after %s: %v", since(start), err)
 		return nil, fmt.Errorf("crt.sh db: %w", err)
 	}
-	var raw []dbRow
-	for rows.Next() {
-		var r dbRow
-		if err := rows.Scan(&r.id, &r.der); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("crt.sh db: %w", err)
-		}
-		raw = append(raw, r)
-	}
-	if err := rows.Err(); err != nil {
+	raw, err := collectRows(rows, s.maxRows, s.maxBytes)
+	if err != nil {
+		// pgx's Close reads the remaining rows; cancelling first drops the connection instead.
+		stopQuery()
+		rows.Close()
 		Trace(ctx, LevelError, "query failed after %s: %v", since(start), err)
 		return nil, fmt.Errorf("crt.sh db: %w", err)
 	}
@@ -160,7 +196,8 @@ func (s CrtShDB) connect(ctx context.Context) (*pgx.Conn, error) {
 		Trace(ctx, LevelWarn, "attempt %d failed after %s: %v; retrying in %s", attempt+1, since(start), err, delay)
 		select {
 		case <-ctx.Done():
-			return nil, last
+			// Report why it stopped first: Ctrl-C is not a refused connection.
+			return nil, fmt.Errorf("%w (last attempt: %w)", context.Cause(ctx), last)
 		case <-after(delay):
 		}
 	}
@@ -241,7 +278,7 @@ func crtshDBConfig() (*pgx.ConnConfig, error) {
 		MinVersion: tls.VersionTLS12,
 		// Not a skip: VerifyConnection below does the full chain and hostname check.
 		InsecureSkipVerify: true, //nolint:gosec // G402: VerifyConnection verifies chain, hostname and the expired-key pin (#9)
-		VerifyConnection:   verifyWithExpiredPin(crtshDBHost, nil, crtshDBExpiredKeyPin),
+		VerifyConnection:   verifyWithExpiredPin(crtshDBHost, nil, crtshDBExpiredKeyPin, crtshDBPinUntil, nil),
 	}
 	cfg.RuntimeParams = map[string]string{"application_name": UserAgent}
 	// crt.sh sits behind a connection pooler, which breaks named prepared statements.
@@ -254,27 +291,41 @@ func crtshDBConfig() (*pgx.ConnConfig, error) {
 // certificate, valid until 2026-12-21, uses the same key.
 const crtshDBExpiredKeyPin = "f5178a69c95d4f2a114aa431ffd770905b87755f0c4f231675c2847f6a21ebda"
 
+// crtshDBPinUntil ends the exception: the HTTPS certificate with the pinned key
+// expires at this instant, and after it the key has no valid certificate anywhere.
+var crtshDBPinUntil = time.Date(2026, 12, 21, 23, 59, 59, 0, time.UTC)
+
 // verifyWithExpiredPin verifies the chain to roots (nil means the system pool) and
 // the hostname. If that fails only because the leaf has expired, and the leaf's
 // key matches pin, the chain is verified again at the leaf's last valid second.
 // Any other expired certificate for host is rejected: the exception covers one
 // key, not every crt.sh certificate ever issued. Once crt.sh renews, the strict
-// check passes and the pin is unused.
-func verifyWithExpiredPin(host string, roots *x509.CertPool, pin string) func(tls.ConnectionState) error {
+// check passes and the pin is unused. After until the exception ends and the
+// connection fails closed. now is the clock; nil means time.Now.
+func verifyWithExpiredPin(host string, roots *x509.CertPool, pin string, until time.Time, now func() time.Time) func(tls.ConnectionState) error {
+	if now == nil {
+		now = time.Now
+	}
 	return func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return errors.New("server sent no certificate")
 		}
 		leaf := cs.PeerCertificates[0]
-		opts := x509.VerifyOptions{DNSName: host, Roots: roots, Intermediates: x509.NewCertPool()}
+		t := now()
+		opts := x509.VerifyOptions{DNSName: host, Roots: roots, Intermediates: x509.NewCertPool(), CurrentTime: t}
 		for _, c := range cs.PeerCertificates[1:] {
 			opts.Intermediates.AddCert(c)
 		}
 		_, err := leaf.Verify(opts)
-		if err != nil && time.Now().After(leaf.NotAfter) && spkiSHA256(leaf) == pin {
-			// x509.Expired also means "not yet valid", hence the explicit date check above.
-			opts.CurrentTime = leaf.NotAfter
-			_, err = leaf.Verify(opts)
+		// x509.Expired also means "not yet valid", hence the explicit date check.
+		if err != nil && t.After(leaf.NotAfter) && spkiSHA256(leaf) == pin {
+			if t.After(until) {
+				err = fmt.Errorf("the exception for %s's expired certificate ended on %s and %s still serves it; see https://github.com/jfagoagas/ctq/issues/9: %w",
+					host, until.Format(time.DateOnly), host, err)
+			} else {
+				opts.CurrentTime = leaf.NotAfter
+				_, err = leaf.Verify(opts)
+			}
 		}
 		if err != nil {
 			// crypto/tls only wraps its built-in verification; wrap here so callers can tell.
@@ -414,7 +465,7 @@ func scopeDBCerts(rows []dbCert, domain string, subdomains, includeExpired bool,
 		c := Certificate{
 			ID:        strconv.FormatInt(r.id, 10),
 			Source:    "crtsh-db",
-			Issuer:    r.issuer,
+			Issuer:    sanitize(r.issuer),
 			DNSNames:  names,
 			NotBefore: r.notBefore.UTC(),
 			NotAfter:  r.notAfter.UTC(),

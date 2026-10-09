@@ -98,6 +98,7 @@ func TestVerifyWithExpiredPin(t *testing.T) {
 
 	pinned := expired(ca, 2, "crt.sh") // the one expired certificate the pin allows
 	pin := spkiSHA256(pinned)
+	until := now.Add(365 * day)
 	for _, tc := range []struct {
 		name    string
 		leaf    *x509.Certificate
@@ -112,7 +113,7 @@ func TestVerifyWithExpiredPin(t *testing.T) {
 		{"not yet valid", parse(ca.issue(t, 6, now.Add(day), now.Add(30*day), "crt.sh")), "crt.sh", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := verifyWithExpiredPin(tc.host, roots, pin)(tls.ConnectionState{PeerCertificates: []*x509.Certificate{tc.leaf}})
+			err := verifyWithExpiredPin(tc.host, roots, pin, until, nil)(tls.ConnectionState{PeerCertificates: []*x509.Certificate{tc.leaf}})
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -124,11 +125,84 @@ func TestVerifyWithExpiredPin(t *testing.T) {
 
 	// "Not yet valid" is reported as x509.Expired too; the pin must not cover it.
 	future := parse(ca.issue(t, 7, now.Add(day), now.Add(30*day), "crt.sh"))
-	if err := verifyWithExpiredPin("crt.sh", roots, spkiSHA256(future))(tls.ConnectionState{PeerCertificates: []*x509.Certificate{future}}); err == nil {
+	if err := verifyWithExpiredPin("crt.sh", roots, spkiSHA256(future), until, nil)(tls.ConnectionState{PeerCertificates: []*x509.Certificate{future}}); err == nil {
 		t.Error("accepted a pinned certificate that is not valid yet")
 	}
-	if err := verifyWithExpiredPin("crt.sh", roots, pin)(tls.ConnectionState{}); err == nil {
+	if err := verifyWithExpiredPin("crt.sh", roots, pin, until, nil)(tls.ConnectionState{}); err == nil {
 		t.Error("accepted a connection without certificates")
+	}
+}
+
+func TestVerifyWithExpiredPinEnds(t *testing.T) {
+	ca := newTestCA(t)
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.cert)
+	day := 24 * time.Hour
+	// Expired a month before the pin ends, like crt.sh's certificate on port 5432.
+	leaf, err := x509.ParseCertificate(ca.issue(t, 2, crtshDBPinUntil.Add(-90*day), crtshDBPinUntil.Add(-30*day), "crt.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+	at := func(t time.Time) func() time.Time { return func() time.Time { return t } }
+
+	if err := verifyWithExpiredPin("crt.sh", roots, spkiSHA256(leaf), crtshDBPinUntil, at(crtshDBPinUntil))(cs); err != nil {
+		t.Errorf("rejected at the pin's last second: %v", err)
+	}
+	err = verifyWithExpiredPin("crt.sh", roots, spkiSHA256(leaf), crtshDBPinUntil, at(crtshDBPinUntil.Add(time.Second)))(cs)
+	if err == nil {
+		t.Fatal("accepted the pinned expired certificate after the pin ended")
+	}
+	if !strings.Contains(err.Error(), "issues/9") || !strings.Contains(err.Error(), "2026-12-21") {
+		t.Errorf("error does not explain itself: %v", err)
+	}
+	if classifyConnErr(fmt.Errorf("connect: %w", err)) != connFatal {
+		t.Errorf("an ended pin is retryable: %v", err)
+	}
+}
+
+type fakeRows struct {
+	rows [][]byte
+	next int
+}
+
+func (f *fakeRows) Next() bool { f.next++; return f.next <= len(f.rows) }
+func (f *fakeRows) Err() error { return nil }
+func (f *fakeRows) Scan(dest ...any) error {
+	*dest[0].(*int64) = int64(f.next)
+	*dest[1].(*[]byte) = f.rows[f.next-1]
+	return nil
+}
+
+func TestCollectRowsCaps(t *testing.T) {
+	der := make([]byte, 1000)
+	rows := func(n int) *fakeRows { return &fakeRows{rows: slices.Repeat([][]byte{der}, n)} }
+	for _, tc := range []struct {
+		name              string
+		n                 int
+		maxRows, maxBytes int
+		wantErr           bool
+	}{
+		{"under both caps", 10, 10, 10 * 1000, false},
+		{"one row too many", 11, 10, 1 << 20, true},
+		{"one byte too many", 10, 100, 10*1000 - 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := rows(tc.n)
+			raw, err := collectRows(f, tc.maxRows, tc.maxBytes)
+			if !tc.wantErr {
+				if err != nil || len(raw) != tc.n {
+					t.Fatalf("%d rows, err = %v", len(raw), err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "narrower domain") {
+				t.Fatalf("err = %v", err)
+			}
+			if f.next > tc.n {
+				t.Error("read past the cap")
+			}
+		})
 	}
 }
 
@@ -602,8 +676,9 @@ func TestCrtShDBConnectCancelInterruptsBackoff(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if !errors.Is(err, refused) {
-			t.Errorf("err = %v, want %v", err, refused)
+		// Cancelled, not refused: callers treat Ctrl-C as a clean exit.
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, refused) || !strings.Contains(err.Error(), refused.Error()) {
+			t.Errorf("err = %v, want %v and %v", err, context.Canceled, refused)
 		}
 		if dials != 1 {
 			t.Errorf("dials = %d, want 1", dials)
@@ -634,5 +709,15 @@ func TestCrtShDBConnectStopsWhenOutOfTime(t *testing.T) {
 	}
 	if dials != 1 {
 		t.Errorf("dials = %d, want 1", dials)
+	}
+}
+
+func TestScopeDBCertsSanitizes(t *testing.T) {
+	// crt.sh's own parser fills issuer for rows Go rejects, unescaped.
+	now := time.Now()
+	row := dbCert{id: 1, key: "k", issuer: "CN=\x1b[2J", names: []string{"\x1b]0;evil\x07.example.com"}, notBefore: now, notAfter: now.Add(time.Hour)}
+	certs := scopeDBCerts([]dbCert{row}, "example.com", true, false, now)
+	if len(certs) != 1 || certs[0].Issuer != `CN=\x1b[2J` || !slices.Equal(certs[0].DNSNames, []string{`\x1b]0;evil\x07.example.com`}) {
+		t.Errorf("certs = %q", certs)
 	}
 }
