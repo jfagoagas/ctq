@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -68,4 +69,22 @@ func tileX509(der []byte) []byte {
 
 func tilePrecert(der []byte) []byte {
 	return cat(u(8, 1), u(2, precertEntry), make([]byte, 32), vec(3, []byte("tbs")), vec(2, nil), vec(3, der), vec(2, nil))
+}
+
+// fakeDER is a stand-in leaf certificate. The log parsers never decode DER, so tests
+// that need many entries skip the key generation in makeCert.
+func fakeDER(index uint64) []byte { return []byte(fmt.Sprintf("der-%d", index)) }
+
+// dataTile builds a data tile of n x509 leaves starting at first, each carrying fakeDER.
+func dataTile(first, n uint64) []byte {
+	var out []byte
+	for i := first; i < first+n; i++ {
+		out = append(out, tileX509(fakeDER(i))...)
+	}
+	return out
+}
+
+// checkpointBody builds a static-ct-api checkpoint note for a tree of the given size.
+func checkpointBody(size uint64) []byte {
+	return []byte(fmt.Sprintf("example.com/log\n%d\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n— example.com/log AAAAAAAA\n", size))
 }
