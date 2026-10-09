@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"charm.land/bubbles/v2/table"
@@ -202,14 +205,11 @@ func TestFilter(t *testing.T) {
 func TestFilterInputSwallowsShortcuts(t *testing.T) {
 	m := newTestModel(t)
 	m.Update(key("/"))
-	_, cmd := m.Update(key("q"))
-	if cmd != nil {
-		if _, quit := cmd().(tea.QuitMsg); quit {
-			t.Fatal("typing q in the filter quit the app")
-		}
-	}
-	if m.filter.Value() != "q" {
-		t.Errorf("filter = %q", m.filter.Value())
+	m.Update(key("q"))
+	// The returned cmd is the cursor blink, a real timer, so check the state instead:
+	// a q that reached the filter can't also have quit.
+	if !m.filtering || m.filter.Value() != "q" {
+		t.Errorf("filtering=%v filter=%q, want the q typed into the filter", m.filtering, m.filter.Value())
 	}
 }
 
@@ -813,4 +813,125 @@ func TestSinkCapsSourceEvents(t *testing.T) {
 	if len(snap.events) != maxSourceEvents || snap.events[0].msg != "10" || snap.events[len(snap.events)-1].seq != maxSourceEvents+10 {
 		t.Errorf("events = %d, first %q", len(snap.events), snap.events[0].msg)
 	}
+}
+
+func TestLiveMatchesCapped(t *testing.T) {
+	m := newTestModel(t)
+	for i := range maxLiveMatches + 10 {
+		m.Update(matchMsg{gen: m.watchGen, match: ct.Match{Log: "Argon", Index: uint64(i), Certificate: cert(fmt.Sprint(i), "CN=x", now, "a.example.com")}})
+	}
+	if len(m.live) != maxLiveMatches {
+		t.Fatalf("live = %d matches, want the cap %d", len(m.live), maxLiveMatches)
+	}
+	if first, last := m.live[0].Index, m.live[len(m.live)-1].Index; first != 10 || last != maxLiveMatches+9 {
+		t.Errorf("kept indexes %d..%d, want the newest %d..%d", first, last, 10, maxLiveMatches+9)
+	}
+}
+
+func TestSinkDropsReportsFromReplacedWatcher(t *testing.T) {
+	s := newSink()
+	oldProgress, oldError := s.startWatch()
+	newProgress, _ := s.startWatch()
+	// The cancelled watcher finishes a poll after the new one started.
+	oldProgress(ct.Log{URL: "a"}, 5, 10)
+	oldError(ct.Log{URL: "b"}, errors.New("404"))
+	if logs := s.snapshot().logs; len(logs) != 0 {
+		t.Fatalf("a replaced watcher refilled the log table: %+v", logs)
+	}
+	newProgress(ct.Log{URL: "a"}, 10, 10)
+	if logs := s.snapshot().logs; len(logs) != 1 {
+		t.Fatalf("logs = %+v, want the new watcher's report", logs)
+	}
+}
+
+// runCmds runs a Cmd, and every Cmd in it when it's a batch, in background goroutines.
+func runCmds(cmd tea.Cmd) {
+	go func() {
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, c := range batch {
+				if c != nil {
+					go c()
+				}
+			}
+		}
+	}()
+}
+
+func TestShutdownWaitsForWatcher(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := newTestModel(t)
+		var saved bool
+		m.opts.Backend.Watch = func(ctx context.Context, _ string, _ WatchHooks) error {
+			<-ctx.Done()
+			time.Sleep(time.Second) // the final State.Save
+			saved = true
+			return ctx.Err()
+		}
+		_, cmd := m.Update(key("w"))
+		runCmds(cmd)
+		m.Update(key("q"))
+
+		if !m.Shutdown(3*time.Second) || !saved {
+			t.Fatal("Shutdown returned before the watcher saved its state")
+		}
+	})
+}
+
+func TestShutdownGivesUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := newTestModel(t)
+		release := make(chan struct{})
+		m.opts.Backend.Watch = func(context.Context, string, WatchHooks) error {
+			<-release // ignores cancellation
+			return nil
+		}
+		_, cmd := m.Update(key("w"))
+		runCmds(cmd)
+
+		start := time.Now()
+		if m.Shutdown(3 * time.Second) {
+			t.Fatal("Shutdown reported a stuck watcher as finished")
+		}
+		if waited := time.Since(start); waited != 3*time.Second {
+			t.Errorf("waited %s, want 3s", waited)
+		}
+		close(release)
+	})
+}
+
+func TestSwitchDomainWaitsForOldWatcher(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := newTestModel(t)
+		var mu sync.Mutex
+		var events []string
+		record := func(e string) {
+			mu.Lock()
+			defer mu.Unlock()
+			events = append(events, e)
+		}
+		m.opts.Backend.Watch = func(ctx context.Context, domain string, _ WatchHooks) error {
+			record("start " + domain)
+			<-ctx.Done()
+			time.Sleep(time.Second) // the final State.Save
+			record("stop " + domain)
+			return ctx.Err()
+		}
+		_, cmd := m.Update(key("w"))
+		runCmds(cmd)
+		synctest.Wait()
+
+		m.Update(key("d"))
+		typeText(m, "other.org")
+		_, cmd = m.Update(key("enter"))
+		runCmds(cmd)
+		if !m.Shutdown(3 * time.Second) {
+			t.Fatal("watchers did not finish")
+		}
+
+		want := []string{"start example.com", "stop example.com", "start other.org", "stop other.org"}
+		if !slices.Equal(events, want) {
+			t.Errorf("events = %q, want %q: two watchers ran on the same state file", events, want)
+		}
+	})
 }

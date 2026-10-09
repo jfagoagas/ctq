@@ -3,6 +3,7 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -73,6 +74,10 @@ func (s sortMode) String() string {
 	return [...]string{"zone", "newest", "expiring", "most seen"}[s]
 }
 
+// maxLiveMatches caps the Live tab. A busy domain would otherwise grow it for as
+// long as the TUI stays open.
+const maxLiveMatches = 1000
+
 const (
 	newWindow      = 7 * 24 * time.Hour
 	expiringWindow = 14 * 24 * time.Hour
@@ -99,6 +104,7 @@ type (
 )
 
 type nameStat struct {
+	zone       string // zoneKey of the name, computed once: sorting runs on every live match
 	seen       int
 	firstSeen  time.Time
 	lastExpiry time.Time
@@ -156,6 +162,7 @@ type Model struct {
 	liveWanted   bool // whether a domain switch should restart the live feed
 	watchGen     int
 	watchCancel  context.CancelFunc
+	watchDone    chan struct{} // closed when the newest watcher, and every one before it, has exited
 	watchErr     error
 
 	sink    *sink
@@ -286,8 +293,10 @@ func (m *Model) startWatch() tea.Cmd {
 	m.watchCancel = cancel
 	m.watchGen++
 	m.watching, m.watchErr, m.watchStarted = true, nil, m.now()
-	m.sink.resetLogs()
+	progress, logError := m.sink.startWatch()
 	gen, domain, watch, ch := m.watchGen, m.domain, m.opts.Backend.Watch, m.matches
+	prev, done := m.watchDone, make(chan struct{})
+	m.watchDone = done
 	hooks := WatchHooks{
 		Emit: func(mt ct.Match) {
 			select {
@@ -295,11 +304,38 @@ func (m *Model) startWatch() tea.Cmd {
 			case <-ctx.Done():
 			}
 		},
-		Progress: m.sink.progress,
-		Error:    m.sink.logError,
+		Progress: progress,
+		Error:    logError,
 		Warn:     m.sink,
 	}
-	return func() tea.Msg { return watchDoneMsg{gen: gen, err: watch(ctx, domain, hooks)} }
+	return func() tea.Msg {
+		defer close(done)
+		// The previous watcher is cancelled but may still be saving offsets, to the
+		// same state file this one is about to load and write.
+		if prev != nil {
+			<-prev
+		}
+		return watchDoneMsg{gen: gen, err: watch(ctx, domain, hooks)}
+	}
+}
+
+// Shutdown stops the live feed and waits up to timeout for the watcher to exit, so
+// it gets to save its log offsets. Bubble Tea doesn't wait for running commands when
+// it quits, so call this after the program returns. It reports whether the watcher
+// finished in time.
+func (m *Model) Shutdown(timeout time.Duration) bool {
+	m.stopWatch()
+	if m.watchDone == nil {
+		return true
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-m.watchDone:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 func (m *Model) stopWatch() {
@@ -370,6 +406,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		mt := msg.match
 		m.live = append(m.live, mt)
+		if n := len(m.live); n > maxLiveMatches {
+			m.live = m.live[n-maxLiveMatches:]
+		}
 		m.addNames(mt.Certificate, true)
 		m.sortNames()
 		if m.tab != tabLive {
@@ -556,7 +595,7 @@ func (m *Model) addNames(c ct.Certificate, live bool) {
 	for _, n := range c.DNSNames {
 		s := m.names[n]
 		if s == nil {
-			s = &nameStat{firstSeen: c.NotBefore, issuers: map[string]struct{}{}}
+			s = &nameStat{zone: zoneKey(n), firstSeen: c.NotBefore, issuers: map[string]struct{}{}}
 			m.names[n] = s
 		}
 		s.seen++
@@ -585,25 +624,21 @@ func (m *Model) sortNames() {
 	for n := range m.names {
 		m.nameList = append(m.nameList, n)
 	}
-	byZone := func(a, b string) bool { return zoneKey(a) < zoneKey(b) }
-	sort.Slice(m.nameList, func(i, j int) bool {
-		a, b := m.nameList[i], m.nameList[j]
+	slices.SortFunc(m.nameList, func(a, b string) int {
 		sa, sb := m.names[a], m.names[b]
+		var c int
 		switch m.sort {
 		case sortNewest:
-			if !sa.firstSeen.Equal(sb.firstSeen) {
-				return sa.firstSeen.After(sb.firstSeen)
-			}
+			c = sb.firstSeen.Compare(sa.firstSeen)
 		case sortExpiring:
-			if !sa.lastExpiry.Equal(sb.lastExpiry) {
-				return sa.lastExpiry.Before(sb.lastExpiry)
-			}
+			c = sa.lastExpiry.Compare(sb.lastExpiry)
 		case sortSeen:
-			if sa.seen != sb.seen {
-				return sa.seen > sb.seen
-			}
+			c = cmp.Compare(sb.seen, sa.seen)
 		}
-		return byZone(a, b)
+		if c != 0 {
+			return c
+		}
+		return strings.Compare(sa.zone, sb.zone)
 	})
 }
 

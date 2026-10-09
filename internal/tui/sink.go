@@ -61,6 +61,7 @@ type sink struct {
 	logs     map[string]*logHealth
 	events   []sourceEvent // oldest first, at most maxSourceEvents
 	eventSeq int
+	watchGen int // only the newest watcher's hooks may touch logs
 }
 
 // sourceEvent is one line of search activity in the Sources tab.
@@ -130,6 +131,10 @@ func (s *sink) health(l ct.Log) *logHealth {
 func (s *sink) progress(l ct.Log, next, size uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.setProgress(l, next, size)
+}
+
+func (s *sink) setProgress(l ct.Log, next, size uint64) {
 	h := s.health(l)
 	h.next, h.size = next, size
 	// Only a fully caught-up poll proves the log is healthy again. A partial
@@ -143,16 +148,40 @@ func (s *sink) progress(l ct.Log, next, size uint64) {
 func (s *sink) logError(l ct.Log, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.addError(l, err)
+}
+
+func (s *sink) addError(l ct.Log, err error) {
 	h := s.health(l)
 	h.failures++
 	h.lastErr = err.Error()
 	h.lastErrAt = time.Now()
 }
 
-func (s *sink) resetLogs() {
+// startWatch clears log health for a new watcher and returns hooks bound to it.
+// A cancelled watcher can still report a poll that was in flight. Once a newer
+// watcher has started, its hooks drop those reports instead of refilling the table.
+func (s *sink) startWatch() (progress func(ct.Log, uint64, uint64), logError func(ct.Log, error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logs = map[string]*logHealth{}
+	s.watchGen++
+	gen := s.watchGen
+	progress = func(l ct.Log, next, size uint64) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.watchGen == gen {
+			s.setProgress(l, next, size)
+		}
+	}
+	logError = func(l ct.Log, err error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.watchGen == gen {
+			s.addError(l, err)
+		}
+	}
+	return progress, logError
 }
 
 func (s *sink) snapshot() snapshot {
