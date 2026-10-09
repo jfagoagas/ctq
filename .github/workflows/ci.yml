@@ -13,11 +13,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The main branch ruleset requires a check named "Test". Matrix jobs report as
+  # "Test (<os>)", so this job keeps the required name and passes only when every
+  # OS passed. Update the ruleset before renaming it.
   test:
     name: Test
+    needs: test-os
+    if: always()
     runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All OS test jobs passed
+        env:
+          RESULT: ${{ needs.test-os.result }}
+        run: test "$RESULT" = success
+
+  test-os:
+    name: Test (${{ matrix.os }})
+    # Releases ship darwin and windows binaries, and file handling (renaming
+    # over an existing file, path separators) differs per OS.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: bash # same syntax on Windows (Git Bash)
     steps:
       # Actions are pinned to commit SHAs. Tags can be moved; SHAs can't.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,10 +50,36 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      # Formatting and module tidiness don't depend on the OS: check them once.
       - name: gofmt
+        if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go mod tidy
+        if: runner.os == 'Linux'
+        run: go mod tidy -diff
       - run: go vet ./...
-      - run: go test -race ./...
+      # -shuffle=on surfaces tests that depend on running order; the seed is
+      # printed so a failure can be replayed with -shuffle=<seed>.
+      - run: go test -race -shuffle=on ./...
+
+  govulncheck:
+    name: Vulnerability reachability (govulncheck)
+    # grype (vulnscan) is the release gate and flags every vulnerable module.
+    # govulncheck adds call-graph reachability: it fails only when our code can
+    # reach the vulnerable symbol, including in the standard library.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # go run with an exact version: the repo's Actions policy doesn't allow
+      # golang/govulncheck-action, and the module proxy checksum pins the code.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   golangci-lint:
     name: Lint (golangci-lint)
