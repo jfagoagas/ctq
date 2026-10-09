@@ -76,7 +76,7 @@ func (s CrtSh) Search(ctx context.Context, domain string, subdomains, includeExp
 			continue
 		}
 		certs = append(certs, Certificate{
-			ID: strconv.FormatInt(r.ID, 10), Source: s.Name(), Issuer: r.IssuerName,
+			ID: strconv.FormatInt(r.ID, 10), Source: s.Name(), Issuer: sanitize(r.IssuerName),
 			DNSNames: names, NotBefore: nb, NotAfter: na,
 		})
 	}
@@ -203,7 +203,7 @@ func (s CertSpotter) Search(ctx context.Context, domain string, subdomains, incl
 			}
 			c := Certificate{ID: r.ID, Source: s.Name(), DNSNames: names, NotBefore: nb, NotAfter: na}
 			if r.Issuer != nil {
-				c.Issuer = r.Issuer.Name
+				c.Issuer = sanitize(r.Issuer.Name)
 			}
 			certs = append(certs, c)
 		}

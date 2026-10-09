@@ -1,6 +1,7 @@
 package ct
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -32,7 +33,15 @@ type Client struct {
 	Retries       int
 	Backoff       time.Duration
 	MaxRetryAfter time.Duration
+
+	maxBodyBytes int64 // tests lower it; zero means defaultMaxBody
 }
+
+// defaultMaxBody caps a response body. A full data tile is ~1-2 MiB; crt.sh results for
+// huge domains are bigger.
+const defaultMaxBody = 64 << 20
+
+func (c *Client) maxBody() int64 { return cmp.Or(c.maxBodyBytes, defaultMaxBody) }
 
 func NewClient(timeout time.Duration, retries int) *Client {
 	return &Client{
@@ -79,12 +88,16 @@ func (c *Client) Get(ctx context.Context, rawURL string, header map[string]strin
 			}
 			last = err
 		} else {
-			// 64 MiB cap: a full data tile is ~1-2 MiB, crt.sh results for huge domains are bigger.
-			body, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			body, rerr := io.ReadAll(io.LimitReader(resp.Body, c.maxBody()+1))
 			resp.Body.Close()
 			switch {
 			case rerr != nil:
 				last = rerr
+			case int64(len(body)) > c.maxBody():
+				// A bigger body won't shrink on retry, and cutting it would fail later as bad JSON.
+				err := fmt.Errorf("response from %s exceeds %d MiB", redact(rawURL), c.maxBody()>>20)
+				Trace(ctx, LevelError, "%v", err)
+				return nil, err
 			case resp.StatusCode < 300:
 				Trace(ctx, LevelInfo, "HTTP %d, %d bytes in %s", resp.StatusCode, len(body), since(start))
 				return &Response{Header: resp.Header, Body: body}, nil

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -91,6 +92,60 @@ func TestCrtSh(t *testing.T) {
 	}
 	if certs[0].NotAfter != time.Date(2026, 11, 30, 0, 0, 0, 0, time.UTC) {
 		t.Errorf("NotAfter = %v", certs[0].NotAfter)
+	}
+}
+
+func TestClientBodyTooLarge(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, strings.Repeat("x", 2<<20+1))
+	}))
+	defer srv.Close()
+
+	c := testClient(3)
+	c.maxBodyBytes = 2 << 20
+	_, err := c.Get(context.Background(), srv.URL+"/?token=secret", nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 2 MiB") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("hits = %d: an oversized body was retried", hits.Load())
+	}
+
+	// Exactly at the cap is fine.
+	c.maxBodyBytes = 2<<20 + 1
+	if resp, err := c.Get(context.Background(), srv.URL, nil); err != nil || len(resp.Body) != 2<<20+1 {
+		t.Fatalf("at the cap: err = %v", err)
+	}
+}
+
+func TestSearchSanitizesJSONSources(t *testing.T) {
+	// Escapes in JSON strings decode to raw control characters.
+	const evil = `\u001b]0;evil\u0007`
+	const want = `\x1b]0;evil\x07`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/issuances") {
+			fmt.Fprint(w, `[{"id":"1","dns_names":["`+evil+`.example.com"],"issuer":{"name":"CN=`+evil+`"},
+				"not_before":"2026-09-01T00:00:00Z","not_after":"2026-11-30T00:00:00Z"}]`)
+			return
+		}
+		fmt.Fprint(w, `[{"id":1,"issuer_name":"CN=`+evil+`","common_name":"`+evil+`.example.com","name_value":"a.example.com",
+			"not_before":"2026-09-01T00:00:00","not_after":"2026-11-30T00:00:00"}]`)
+	}))
+	defer srv.Close()
+
+	for _, s := range []Searcher{
+		CrtSh{Client: testClient(0), BaseURL: srv.URL + "/"},
+		CertSpotter{Client: testClient(0), BaseURL: srv.URL + "/v1/issuances"},
+	} {
+		certs, err := s.Search(context.Background(), "example.com", true, false)
+		if err != nil {
+			t.Fatalf("%s: %v", s.Name(), err)
+		}
+		if len(certs) != 1 || certs[0].Issuer != "CN="+want || !slices.Contains(certs[0].DNSNames, want+".example.com") {
+			t.Errorf("%s: %q", s.Name(), certs)
+		}
 	}
 }
 

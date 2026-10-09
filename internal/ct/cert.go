@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Certificate is the backend-agnostic view of one logged certificate.
@@ -52,12 +54,12 @@ func Matches(name, domain string, subdomains bool) bool {
 	return subdomains && strings.HasSuffix(bare, "."+domain)
 }
 
-// Scope drops names outside the query. Multi-domain certs (CDNs, SaaS) carry
-// dozens of unrelated SANs, and every backend returns them.
+// Scope drops names outside the query and sanitizes the rest. Multi-domain certs
+// (CDNs, SaaS) carry dozens of unrelated SANs, and every backend returns them.
 func Scope(names []string, domain string, subdomains bool) []string {
 	set := make(map[string]struct{}, len(names))
 	for _, n := range names {
-		if n = NormalizeName(n); n != "" && Matches(n, domain, subdomains) {
+		if n = sanitize(NormalizeName(n)); n != "" && Matches(n, domain, subdomains) {
 			set[n] = struct{}{}
 		}
 	}
@@ -77,11 +79,38 @@ func fromX509(id, source string, c *x509.Certificate, domain string, subdomains 
 	return Certificate{
 		ID:        id,
 		Source:    source,
-		Issuer:    c.Issuer.String(),
+		Issuer:    sanitize(c.Issuer.String()),
 		DNSNames:  names,
 		NotBefore: c.NotBefore.UTC(),
 		NotAfter:  c.NotAfter.UTC(),
 	}, true
+}
+
+// sanitize escapes invalid UTF-8 and runes that are not printable, so text from
+// CT data can't drive the terminal. Go's IA5String check lets ESC and BEL through,
+// DN formatting doesn't escape them, and the aggregators' JSON isn't checked at all.
+func sanitize(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return r == utf8.RuneError || !unicode.IsPrint(r) }) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case !unicode.IsPrint(r) && r <= 0xff:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case !unicode.IsPrint(r) && r <= 0xffff:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		case !unicode.IsPrint(r):
+			fmt.Fprintf(&b, `\U%08x`, r)
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
 }
 
 var cnRe = regexp.MustCompile(`CN=([^,]+)`)
