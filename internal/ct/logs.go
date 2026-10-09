@@ -164,12 +164,21 @@ func (l *TiledLog) Size(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Checkpoint note body: origin line, tree size line, root hash line, then signatures.
-	lines := strings.SplitN(string(resp.Body), "\n", 3)
+	return parseCheckpoint(resp.Body)
+}
+
+// parseCheckpoint reads the tree size from a checkpoint note body: origin line, tree
+// size line, root hash line, then signatures.
+func parseCheckpoint(body []byte) (uint64, error) {
+	lines := strings.SplitN(string(body), "\n", 3)
 	if len(lines) < 2 {
 		return 0, fmt.Errorf("checkpoint: malformed")
 	}
-	return strconv.ParseUint(lines[1], 10, 64)
+	size, err := strconv.ParseUint(lines[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("checkpoint: %w", err)
+	}
+	return size, nil
 }
 
 // Fetch reads the data tile that contains start. end must be a tile boundary or the
