@@ -479,6 +479,7 @@ func runTUI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		},
 	})
 	_, err := tea.NewProgram(model, tea.WithContext(ctx)).Run()
+	model.Shutdown(3 * time.Second) // let the watcher save -state before the process exits
 	// SIGTERM cancels ctx and Bubble Tea reports that as "killed". It wraps panics in
 	// ErrProgramKilled too, so only a cancelled context counts as a clean exit.
 	if errors.Is(err, tea.ErrProgramKilled) && !errors.Is(err, tea.ErrProgramPanic) && ctx.Err() != nil {
