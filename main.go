@@ -1,11 +1,14 @@
 // Command ctq queries Certificate Transparency for a domain.
 //
-//	ctq search [flags] <domain>   historical certs via crt.sh / Cert Spotter
-//	ctq watch  [flags] <domain>   new certs, read straight from the CT logs
-//	ctq tui    [flags] <domain>   interactive view over both
+//	ctq search [flags] <domain>   certificates already logged (crt.sh, Cert Spotter)
+//	ctq watch  [flags] <domain>   new certificates, tailed directly from all CT logs
+//	ctq tui    [flags] [domain]   interactive: history, live feed and subdomain inventory
+//	ctq version                   print the version
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +17,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -51,8 +55,26 @@ func main() {
 	os.Exit(code)
 }
 
-// run executes one ctq command and returns the process exit code:
-// 0 on success, 1 when the command fails, 2 for a missing or unknown command.
+// Valid values for -source and -o, checked right after flag parsing so a typo
+// fails before any network work.
+var (
+	sources = []string{"auto", "crtsh-db", "crtsh", "certspotter"}
+	outputs = []string{"names", "table", "json"}
+)
+
+// usageError is a bad command line: a flag, flag value or domain argument. run exits 2 on it.
+type usageError struct{ err error }
+
+func (e usageError) Error() string { return e.err.Error() }
+func (e usageError) Unwrap() error { return e.err }
+
+func usageErrorf(format string, a ...any) error {
+	return usageError{fmt.Errorf(format, a...)}
+}
+
+// run executes one ctq command and returns the process exit code: 0 on success
+// (and for -h), 1 when the command fails, 2 for a bad command line, and 130 when
+// Ctrl-C interrupts a search, so `ctq search x > f && next` stops there.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprint(stderr, usage)
@@ -65,7 +87,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "watch":
 		err = runWatch(ctx, args[1:], stdout, stderr)
 	case "tui":
-		err = runTUI(ctx, args[1:], stderr)
+		err = runTUI(ctx, args[1:], stdout, stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -76,27 +98,92 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ctq: unknown command %q\n\n%s", args[0], usage)
 		return 2
 	}
-	if err != nil && !errors.Is(err, context.Canceled) {
+	var ue usageError
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		return 0
+	case errors.As(err, &ue):
+		fmt.Fprintf(stderr, "ctq: %v\n", err)
+		return 2
+	case args[0] == "search" && ctx.Err() != nil:
+		// Interrupted: the output may be partial even when the search returned.
+		return 130
+	case err != nil && !errors.Is(err, context.Canceled):
 		fmt.Fprintf(stderr, "ctq: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func parseArgs(fs *flag.FlagSet, args []string) (string, error) {
-	if err := fs.Parse(args); err != nil {
+// newFlagSet returns a flag set whose usage shows "ctq <synopsis>" and the flags.
+func newFlagSet(name, synopsis string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: ctq %s\n\nFlags:\n", synopsis)
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
+// parseFlags parses args and leaves fs writing to stderr. The usage that -h asks
+// for goes to stdout; a parse error and its usage go to stderr as a usageError.
+func parseFlags(fs *flag.FlagSet, args []string, stdout, stderr io.Writer) error {
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	err := fs.Parse(args)
+	fs.SetOutput(stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stdout, buf.String())
+		return err
+	}
+	fmt.Fprint(stderr, buf.String())
+	if err != nil {
+		return usageError{err}
+	}
+	return nil
+}
+
+// parseArgs parses flags and the one domain argument.
+func parseArgs(fs *flag.FlagSet, args []string, stdout, stderr io.Writer) (string, error) {
+	if err := parseFlags(fs, args, stdout, stderr); err != nil {
 		return "", err
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return "", errors.New("expected exactly one domain")
+		return "", usageErrorf("expected exactly one domain")
 	}
-	return ct.NormalizeDomain(fs.Arg(0))
+	return normalizeDomain(fs.Arg(0))
+}
+
+func normalizeDomain(s string) (string, error) {
+	d, err := ct.NormalizeDomain(s)
+	if err != nil {
+		return "", usageError{err}
+	}
+	return d, nil
+}
+
+// checkChoice rejects a flag value outside choices.
+func checkChoice(what, value string, choices []string) error {
+	if !slices.Contains(choices, value) {
+		return usageErrorf("unknown %s %q (want %s)", what, value, strings.Join(choices, ", "))
+	}
+	return nil
+}
+
+// checkWatchFlags rejects values that would crash or stall the watcher.
+func checkWatchFlags(interval time.Duration, workers int) error {
+	if interval <= 0 {
+		return usageErrorf("-interval must be positive, got %s", interval)
+	}
+	if workers <= 0 {
+		return usageErrorf("-workers must be positive, got %d", workers)
+	}
+	return nil
 }
 
 func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("search", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("search", "search [flags] <domain>")
 	source := fs.String("source", "auto", "auto | crtsh-db | crtsh | certspotter")
 	output := fs.String("o", "names", "names | table | json")
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
@@ -104,8 +191,14 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	issuer := fs.String("issuer", "", "only certs whose issuer contains this (case-insensitive)")
 	timeout := fs.Duration("timeout", 60*time.Second, "per-request timeout")
 	verbose := fs.Bool("v", false, "print each source's connections, requests, retries and fallbacks to stderr")
-	domain, err := parseArgs(fs, args)
+	domain, err := parseArgs(fs, args, stdout, stderr)
 	if err != nil {
+		return err
+	}
+	if err := checkChoice("source", *source, sources); err != nil {
+		return err
+	}
+	if err := checkChoice("output", *output, outputs); err != nil {
 		return err
 	}
 
@@ -175,9 +268,11 @@ func writeSearch(w io.Writer, format string, certs []ct.Certificate, now time.Ti
 			}
 		}
 		sort.Strings(names)
+		bw := bufio.NewWriter(w)
 		for _, n := range names {
-			fmt.Fprintln(w, n)
+			fmt.Fprintln(bw, n) // a write error sticks, and Flush returns it
 		}
+		return bw.Flush()
 	case "table":
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "NOT BEFORE\tNOT AFTER\tSTATUS\tISSUER\tNAMES")
@@ -205,12 +300,10 @@ func writeSearch(w io.Writer, format string, certs []ct.Certificate, now time.Ti
 	default:
 		return fmt.Errorf("unknown output %q", format)
 	}
-	return nil
 }
 
 func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("watch", "watch [flags] <domain>")
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
 	interval := fs.Duration("interval", 15*time.Second, "poll interval per log")
 	workers := fs.Int("workers", 4, "concurrent fetches per log")
@@ -218,13 +311,18 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	logFilter := fs.String("log", "", "only logs whose name contains this (case-insensitive)")
 	asJSON := fs.Bool("json", false, "emit JSON lines")
 	verbose := fs.Bool("v", false, "log progress and lag per log to stderr")
-	domain, err := parseArgs(fs, args)
+	domain, err := parseArgs(fs, args, stdout, stderr)
 	if err != nil {
 		return err
 	}
+	if err := checkWatchFlags(*interval, *workers); err != nil {
+		return err
+	}
 
-	// A failed write to stdout (closed pipe, full disk) stops the watch with that
-	// error as the cause, so ctq exits 1 instead of tailing logs into the void.
+	// A failed write to stdout (a full disk or an I/O error on a redirected file)
+	// stops the watch with that error as the cause, so ctq exits 1 instead of
+	// tailing logs into the void. A closed pipe never gets here: a write to a broken
+	// pipe on fd 1 or 2 makes the Go runtime exit with SIGPIPE (see os/signal).
 	ctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
 
@@ -257,8 +355,10 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		if m.Precert {
 			kind = "precert"
 		}
-		fmt.Fprintf(stdout, "%s  %s  %-24s  %s  [%s]\n", time.Now().UTC().Format(time.RFC3339), kind,
-			ct.IssuerCN(m.Issuer), strings.Join(m.DNSNames, ","), m.Log)
+		if _, err := fmt.Fprintf(stdout, "%s  %s  %-24s  %s  [%s]\n", time.Now().UTC().Format(time.RFC3339), kind,
+			ct.IssuerCN(m.Issuer), strings.Join(m.DNSNames, ","), m.Log); err != nil {
+			stop(fmt.Errorf("writing to stdout: %w", err))
+		}
 	}
 	err = w.Run(ctx)
 	// Ctrl-C cancels the parent context, whose cause is context.Canceled: exit 0.
@@ -314,9 +414,8 @@ func newWatcher(ctx context.Context, c watchConfig) (*ct.Watcher, error) {
 	}, nil
 }
 
-func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
-	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+func runTUI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := newFlagSet("tui", "tui [flags] [domain]")
 	source := fs.String("source", "auto", "auto | crtsh-db | crtsh | certspotter (press s to cycle)")
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
 	expired := fs.Bool("expired", false, "include expired certificates in history (crt.sh sources only)")
@@ -326,7 +425,7 @@ func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	workers := fs.Int("workers", 4, "concurrent fetches per log")
 	statePath := fs.String("state", "", "file to persist log offsets; resumes from it on restart")
 	cacheTTL := fs.Duration("cache-ttl", 15*time.Minute, "reuse a search result this long when switching sources or domains (r always searches again); 0 disables")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args, stdout, stderr); err != nil {
 		return err
 	}
 	// The domain is optional here: without one the TUI opens on the domain prompt.
@@ -334,17 +433,21 @@ func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	switch fs.NArg() {
 	case 0:
 	case 1:
-		d, err := ct.NormalizeDomain(fs.Arg(0))
+		d, err := normalizeDomain(fs.Arg(0))
 		if err != nil {
 			return err
 		}
 		domain = d
 	default:
 		fs.Usage()
-		return errors.New("expected at most one domain")
+		return usageErrorf("expected at most one domain")
 	}
-	if _, err := newSearcher(*source, *timeout, nil); err != nil {
-		return err // reject a bad -source before taking over the terminal
+	// Reject bad flag values before taking over the terminal.
+	if err := checkChoice("source", *source, sources); err != nil {
+		return err
+	}
+	if err := checkWatchFlags(*interval, *workers); err != nil {
+		return err
 	}
 
 	model := tui.New(ctx, tui.Options{
@@ -379,7 +482,7 @@ func runTUI(ctx context.Context, args []string, stderr io.Writer) error {
 	// SIGTERM cancels ctx and Bubble Tea reports that as "killed". It wraps panics in
 	// ErrProgramKilled too, so only a cancelled context counts as a clean exit.
 	if errors.Is(err, tea.ErrProgramKilled) && !errors.Is(err, tea.ErrProgramPanic) && ctx.Err() != nil {
-		return nil
+		return nil //nolint:nilerr // a SIGTERM-cancelled TUI is a clean exit, see above
 	}
 	return err
 }

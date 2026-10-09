@@ -108,7 +108,7 @@ A log that fails a poll shows as `retrying` and is retried on the next poll. Aft
 | `w` | turn the live feed on or off |
 | `q` | quit |
 
-`ctq tui` accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, and `-no-live` to start with the live feed off.
+`ctq tui` accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, `-no-live` to start with the live feed off, and `-cache-ttl` (default `15m`) to reuse a search result when switching sources or domains (`r` always searches again, `0` turns the cache off).
 
 ## CLI
 
@@ -170,7 +170,7 @@ Coding agents such as Claude Code can't drive the TUI, which needs an interactiv
 
 - `ctq search -o json example.com` prints a JSON array on stdout, one object per certificate: `id`, `source`, `issuer`, `dns_names`, `not_before`, `not_after` and `expired`. Warnings and `-v` output go to stderr, so stdout always parses.
 - `ctq search example.com` prints one name per line, the smallest output for a context window.
-- The exit status is 0 on success, including when nothing is found (an empty array), 1 on errors and 2 for an unknown command.
+- The exit status is 0 on success, including when nothing is found (an empty array), 1 on errors, 2 for a bad command line (unknown command or flag, bad flag value, missing or invalid domain) and 130 when Ctrl-C interrupts a search. `watch` exits 0 on Ctrl-C.
 - The domain argument is validated before any query, so input an agent builds from a conversation can't turn into a crt.sh wildcard.
 
 Three things trip agents up:
