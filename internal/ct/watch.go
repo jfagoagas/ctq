@@ -47,6 +47,15 @@ type Watcher struct {
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
+	switch {
+	case w.Interval <= 0:
+		return fmt.Errorf("watch: interval must be positive, got %s", w.Interval)
+	case w.Workers <= 0:
+		return fmt.Errorf("watch: workers must be positive, got %d", w.Workers)
+	case w.Emit == nil:
+		return errors.New("watch: Emit is nil")
+	}
+
 	var wg sync.WaitGroup
 	for _, l := range w.Logs {
 		wg.Add(1)
@@ -58,7 +67,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	// Checkpoint offsets on every tick so a crash loses at most one interval.
 	done := make(chan struct{})
+	saver := make(chan struct{})
 	go func() {
+		defer close(saver)
 		t := time.NewTicker(w.Interval)
 		defer t.Stop()
 		for {
@@ -75,6 +86,8 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	wg.Wait()
 	close(done)
+	// A tick can be mid-Save. Its rename must land before the final one, not after.
+	<-saver
 	if n := w.parseErrors.Load(); n > 0 && w.Verbose {
 		warnf(w.Warn, "%d entries could not be parsed", n)
 	}
@@ -100,7 +113,8 @@ func (w *Watcher) tail(ctx context.Context, l Log) {
 		case size > next:
 			next, batch = w.catchUp(ctx, r, l, next, size, batch)
 		}
-		if err == nil {
+		// A cancelled tail stays quiet: its caller may already be showing a new watcher.
+		if err == nil && ctx.Err() == nil {
 			w.progress(l, next, size)
 		}
 
@@ -152,7 +166,9 @@ func (w *Watcher) catchUp(ctx context.Context, r LogReader, l Log, next, size, b
 			next = res.end
 		}
 		w.State.Set(l.URL, next)
-		w.progress(l, next, size)
+		if ctx.Err() == nil {
+			w.progress(l, next, size)
+		}
 		w.debugf("%s: at %d, lag %d", l.Name, next, size-next)
 	}
 	return next, batch
@@ -316,6 +332,12 @@ func (s *State) Save() error {
 		return err
 	}
 	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	// Without Sync a power loss can leave the renamed file empty, and LoadState refuses that.
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return err

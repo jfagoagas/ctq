@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -41,11 +44,17 @@ func TestWatcherMatchesAndDedups(t *testing.T) {
 		"https://a": {entries: entriesFor(miss, hit, miss, nil, hit2), cap: 2},
 		"https://b": {entries: entriesFor(hit, miss), cap: 100},
 	}
+	synctest.Test(t, func(t *testing.T) {
+		testWatcherMatchesAndDedups(t, logs)
+	})
+}
+
+func testWatcherMatchesAndDedups(t *testing.T, logs map[string]*fakeLog) {
 	state, _ := LoadState("")
 	state.Set("https://a", 0)
 	state.Set("https://b", 0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -67,7 +76,9 @@ func TestWatcherMatchesAndDedups(t *testing.T) {
 			mu.Unlock()
 		},
 	}
-	w.Run(ctx)
+	if err := w.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	if len(got) != 2 {
 		t.Fatalf("got %d matches: %+v", len(got), got)
@@ -91,9 +102,14 @@ func TestWatcherMatchesAndDedups(t *testing.T) {
 }
 
 func TestWatcherStartsAtCurrentSize(t *testing.T) {
+	// Certs are made outside the bubble, whose fake clock starts in 2000.
 	log := &fakeLog{entries: entriesFor(makeCert(t, 1, "a.example.com")), cap: 10}
+	synctest.Test(t, func(t *testing.T) { testWatcherStartsAtCurrentSize(t, log) })
+}
+
+func testWatcherStartsAtCurrentSize(t *testing.T, log *fakeLog) {
 	state, _ := LoadState("")
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
 	called := false
@@ -102,7 +118,9 @@ func TestWatcherStartsAtCurrentSize(t *testing.T) {
 		Domain: "example.com", Subdomains: true, Interval: 10 * time.Millisecond, Workers: 1,
 		State: state, Emit: func(Match) { called = true },
 	}
-	w.Run(ctx)
+	if err := w.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if called {
 		t.Error("emitted an entry that was already in the log at startup")
 	}
@@ -142,8 +160,123 @@ func TestStateRoundTrip(t *testing.T) {
 	if n, ok := s2.Get("https://log"); !ok || n != 42 {
 		t.Fatalf("got %d, %v", n, ok)
 	}
+	if fi, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Errorf("state mode = %v, want 0600", fi.Mode().Perm())
+	}
 	os.WriteFile(path, []byte("{bad"), 0o600)
 	if _, err := LoadState(path); err == nil {
 		t.Fatal("corrupt state loaded")
+	}
+}
+
+// blockingWriter parks the first write until release is closed.
+type blockingWriter struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	b.once.Do(func() {
+		close(b.entered)
+		<-b.release
+	})
+	return len(p), nil
+}
+
+func TestWatcherRunWaitsForCheckpointSave(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Saving into a missing directory fails, so the tick's Save ends in a warning,
+		// and the warning parks the checkpoint goroutine mid-Save.
+		state, _ := LoadState(filepath.Join(t.TempDir(), "missing", "state.json"))
+		warn := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		ctx, cancel := context.WithCancel(t.Context())
+		w := &Watcher{
+			Logs: []Log{{Name: "A", URL: "u"}}, NewReader: func(Log) LogReader { return &fakeLog{cap: 1} },
+			Domain: "example.com", Interval: time.Second, Workers: 1,
+			State: state, Emit: func(Match) {}, Warn: warn,
+		}
+		ran := make(chan struct{})
+		go func() {
+			w.Run(ctx)
+			close(ran)
+		}()
+
+		<-warn.entered
+		cancel()
+		synctest.Wait()
+		select {
+		case <-ran:
+			t.Fatal("Run returned while a checkpoint save was still in flight")
+		default:
+		}
+		close(warn.release)
+		<-ran
+	})
+}
+
+// cancellingLog cancels the watch from inside a fetch, like a domain switch mid-batch.
+type cancellingLog struct {
+	fakeLog
+	cancel context.CancelFunc
+}
+
+func (c *cancellingLog) Fetch(ctx context.Context, start, end uint64) ([]Entry, error) {
+	c.cancel()
+	return c.fakeLog.Fetch(ctx, start, end)
+}
+
+func TestWatcherNoProgressAfterCancel(t *testing.T) {
+	entries := entriesFor(makeCert(t, 1, "a.example.com"), makeCert(t, 2, "b.example.com"))
+	synctest.Test(t, func(t *testing.T) {
+		state, _ := LoadState("")
+		state.Set("u", 0)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		log := &cancellingLog{fakeLog: fakeLog{entries: entries, cap: 10}, cancel: cancel}
+
+		var progress []uint64
+		w := &Watcher{
+			Logs: []Log{{Name: "A", URL: "u"}}, NewReader: func(Log) LogReader { return log },
+			Domain: "example.com", Subdomains: true, Interval: time.Second, Workers: 1,
+			State: state, Emit: func(Match) {},
+			Progress: func(_ Log, next, _ uint64) { progress = append(progress, next) },
+		}
+		if err := w.Run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if len(progress) != 0 {
+			t.Errorf("progress reported after cancel: %v", progress)
+		}
+		if n, _ := state.Get("u"); n != 2 {
+			t.Errorf("offset = %d, want 2: the batch read before cancel still counts", n)
+		}
+	})
+}
+
+func TestWatcherRunRejectsBadConfig(t *testing.T) {
+	valid := func() *Watcher {
+		state, _ := LoadState("")
+		return &Watcher{Interval: time.Second, Workers: 1, State: state, Emit: func(Match) {}}
+	}
+	for name, tc := range map[string]struct {
+		mod  func(*Watcher)
+		want string
+	}{
+		"zero interval":     {func(w *Watcher) { w.Interval = 0 }, "interval"},
+		"negative interval": {func(w *Watcher) { w.Interval = -time.Second }, "interval"},
+		"zero workers":      {func(w *Watcher) { w.Workers = 0 }, "workers"},
+		"nil emit":          {func(w *Watcher) { w.Emit = nil }, "Emit"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := valid()
+			tc.mod(w)
+			err := w.Run(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one about %s", err, tc.want)
+			}
+		})
 	}
 }
