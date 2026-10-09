@@ -17,6 +17,8 @@ linters:
     - unused # dead code
     - ineffassign # assignments that are never read
     - errorlint # error comparisons that break with wrapping (== instead of errors.Is)
+    - nilerr # returns nil after checking err != nil (error silently dropped)
+    - durationcheck # two time.Duration values multiplied together
     # Security and resource handling: ctq makes HTTP and Postgres calls to
     # third-party services, so leaked bodies and missing contexts matter.
     - gosec
@@ -29,6 +31,8 @@ linters:
     errcheck:
       # Discarding with `_ =` is an explicit decision; only flag silent drops.
       check-blank: false
+      # `v := x.(T)` panics on a type mismatch; require the two-value form.
+      check-type-assertions: true
     govet:
       enable:
         - nilness
