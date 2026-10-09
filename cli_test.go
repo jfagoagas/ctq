@@ -298,6 +298,8 @@ func TestExitCodes(t *testing.T) {
 	notFound := httptest.NewServer(http.NotFoundHandler())
 	defer notFound.Close()
 	ok, _ := fakeCrtSh(t, searchRows)
+	// Usage errors must fail before any network work; reaching the log list is a bug.
+	stubLogs(t, nil, errors.New("log list fetched"))
 
 	for _, tc := range []struct {
 		name      string
@@ -310,15 +312,25 @@ func TestExitCodes(t *testing.T) {
 		{"unknown command", []string{"serach"}, nil, 2, `unknown command "serach"`},
 		{"help", []string{"help"}, nil, 0, ""},
 		{"version", []string{"version"}, nil, 0, ""},
-		{"search without domain", []string{"search"}, nil, 1, "expected exactly one domain"},
-		{"search two domains", []string{"search", "a.com", "b.com"}, nil, 1, "expected exactly one domain"},
-		{"search invalid domain", []string{"search", "exa%mple.com"}, nil, 1, "invalid domain"},
-		{"search unknown flag", []string{"search", "-nope", "example.com"}, nil, 1, "flag provided but not defined"},
-		{"search unknown source", []string{"search", "-source", "bogus", "example.com"}, nil, 1, `unknown source "bogus"`},
-		{"search unknown output", []string{"search", "-o", "xml", "example.com"}, ok, 1, `unknown output "xml"`},
+		{"search without domain", []string{"search"}, nil, 2, "expected exactly one domain"},
+		{"search two domains", []string{"search", "a.com", "b.com"}, nil, 2, "expected exactly one domain"},
+		{"search invalid domain", []string{"search", "exa%mple.com"}, nil, 2, "invalid domain"},
+		{"search unknown flag", []string{"search", "-nope", "example.com"}, nil, 2, "flag provided but not defined"},
+		{"search bad flag value", []string{"search", "-timeout", "soon", "example.com"}, nil, 2, "invalid value"},
+		{"search unknown source", []string{"search", "-source", "bogus", "example.com"}, nil, 2, `unknown source "bogus"`},
+		{"search unknown output", []string{"search", "-o", "xml", "example.com"}, ok, 2, `unknown output "xml"`},
 		{"search upstream error", []string{"search", "example.com"}, notFound, 1, "HTTP 404"},
-		{"watch without domain", []string{"watch"}, nil, 1, "expected exactly one domain"},
-		{"watch unknown flag", []string{"watch", "-nope", "example.com"}, nil, 1, "flag provided but not defined"},
+		{"watch without domain", []string{"watch"}, nil, 2, "expected exactly one domain"},
+		{"watch unknown flag", []string{"watch", "-nope", "example.com"}, nil, 2, "flag provided but not defined"},
+		{"watch zero interval", []string{"watch", "-interval", "0", "example.com"}, nil, 2, "-interval must be positive"},
+		{"watch negative interval", []string{"watch", "-interval", "-1s", "example.com"}, nil, 2, "-interval must be positive"},
+		{"watch zero workers", []string{"watch", "-workers", "0", "example.com"}, nil, 2, "-workers must be positive"},
+		{"tui two domains", []string{"tui", "a.com", "b.com"}, nil, 2, "expected at most one domain"},
+		{"tui invalid domain", []string{"tui", "exa%mple.com"}, nil, 2, "invalid domain"},
+		{"tui unknown flag", []string{"tui", "-nope"}, nil, 2, "flag provided but not defined"},
+		{"tui unknown source", []string{"tui", "-source", "bogus"}, nil, 2, `unknown source "bogus"`},
+		{"tui zero interval", []string{"tui", "-interval", "0"}, nil, 2, "-interval must be positive"},
+		{"tui negative workers", []string{"tui", "-workers", "-1"}, nil, 2, "-workers must be positive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.upstream != nil {
@@ -335,6 +347,78 @@ func TestExitCodes(t *testing.T) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr, tc.wantInErr)
 			}
 		})
+	}
+}
+
+func TestSubcommandHelp(t *testing.T) {
+	for cmd, synopsis := range map[string]string{
+		"search": "Usage: ctq search [flags] <domain>",
+		"watch":  "Usage: ctq watch [flags] <domain>",
+		"tui":    "Usage: ctq tui [flags] [domain]",
+	} {
+		for _, flag := range []string{"-h", "--help"} {
+			t.Run(cmd+flag, func(t *testing.T) {
+				code, stdout, stderr := runCLI(t, cmd, flag)
+				if code != 0 {
+					t.Errorf("exit %d, want 0 (stderr %q)", code, stderr)
+				}
+				if !strings.HasPrefix(stdout, synopsis+"\n") || !strings.Contains(stdout, "-exact") {
+					t.Errorf("stdout = %q, want the usage starting with %q and the flags", stdout, synopsis)
+				}
+				if stderr != "" {
+					t.Errorf("stderr = %q, want nothing for a requested help", stderr)
+				}
+			})
+		}
+	}
+}
+
+// A bad -o must fail before the search, not after a minute in crt.sh's queue.
+func TestSearchBadOutputSkipsSearch(t *testing.T) {
+	call := stubSearcher(t, func(io.Writer) ct.Searcher {
+		t.Error("searcher built for an invalid -o")
+		return ct.Auto{} // no sources: returns nothing, without the network
+	})
+	code, stdout, stderr := runCLI(t, "search", "-o", "xml", "example.com")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, `ctq: unknown output "xml"`) {
+		t.Errorf("exit %d stdout %q stderr %q, want exit 2 and the error", code, stdout, stderr)
+	}
+	if call.source != "" {
+		t.Errorf("searcher factory called with source %q", call.source)
+	}
+}
+
+// blockingSearcher returns only when its context is done, like a search Ctrl-C interrupts.
+type blockingSearcher struct{}
+
+func (blockingSearcher) Name() string { return "blocking" }
+
+func (blockingSearcher) Search(ctx context.Context, _ string, _, _ bool) ([]ct.Certificate, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// Ctrl-C during a search exits 130, so `ctq search x > f && next` stops there.
+func TestSearchInterruptedExits130(t *testing.T) {
+	stubSearcher(t, func(io.Writer) ct.Searcher { return blockingSearcher{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errOut syncBuffer
+	if code := run(ctx, []string{"search", "example.com"}, &out, &errOut); code != 130 {
+		t.Errorf("exit %d, want 130 (stderr %q)", code, errOut.String())
+	}
+	if out.String() != "" || errOut.String() != "" {
+		t.Errorf("stdout %q stderr %q, want nothing", out.String(), errOut.String())
+	}
+}
+
+func TestSearchNamesStdoutBroken(t *testing.T) {
+	srv, _ := fakeCrtSh(t, searchRows)
+	stubSearcher(t, crtshSearcher(srv))
+	var errOut syncBuffer
+	code := run(context.Background(), []string{"search", "example.com"}, brokenWriter{}, &errOut)
+	if code != 1 || !strings.Contains(errOut.String(), "ctq: broken pipe") {
+		t.Errorf("exit %d stderr %q, want exit 1 and the write error", code, errOut.String())
 	}
 }
 
@@ -507,8 +591,10 @@ type brokenWriter struct{}
 
 func (brokenWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
 
-// A JSON consumer that goes away (ctq watch -json | head -1) must end the watch
-// with exit 1, not leave it tailing logs with nowhere to write.
+// A stdout that fails writes (ENOSPC or EIO on a redirected file, as in
+// ctq watch -json > /full/disk/out) must end the watch with exit 1, not leave it
+// tailing logs with nowhere to write. A closed pipe (ctq watch -json | head -1)
+// never gets that far: the Go runtime exits with SIGPIPE on a write to fd 1.
 func TestWatchJSONStdoutBroken(t *testing.T) {
 	statePath := watchSetup(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -517,6 +603,21 @@ func TestWatchJSONStdoutBroken(t *testing.T) {
 	code := run(ctx, []string{"watch", "-json", "-state", statePath, "-log", "test", "-interval", "20ms", "example.com"},
 		brokenWriter{}, &errOut)
 	if code != 1 || !strings.Contains(errOut.String(), "ctq: writing JSON to stdout: broken pipe") {
+		t.Errorf("exit %d stderr %q, want exit 1 and the write error", code, errOut.String())
+	}
+	if ctx.Err() != nil {
+		t.Error("the watch ran until the test timeout instead of stopping on the write error")
+	}
+}
+
+func TestWatchTextStdoutBroken(t *testing.T) {
+	statePath := watchSetup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var errOut syncBuffer
+	code := run(ctx, []string{"watch", "-state", statePath, "-log", "test", "-interval", "20ms", "example.com"},
+		brokenWriter{}, &errOut)
+	if code != 1 || !strings.Contains(errOut.String(), "ctq: writing to stdout: broken pipe") {
 		t.Errorf("exit %d stderr %q, want exit 1 and the write error", code, errOut.String())
 	}
 	if ctx.Err() != nil {
