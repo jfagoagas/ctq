@@ -63,6 +63,9 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # v0.1.0 and v0.1.0-rc.3 can tag the same commit. Without this,
+          # GoReleaser picks the tag by version sort, which ranks the rc higher.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
 
       # SLSA build provenance: proves each archive was built from this commit by
       # this workflow. checksums.txt is attested too, so it can be trusted to
