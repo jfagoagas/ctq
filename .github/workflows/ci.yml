@@ -110,7 +110,7 @@ jobs:
         with:
           fetch-depth: 0 # the scanned range needs both ends
           persist-credentials: false
-      - uses: trufflesecurity/trufflehog@4c282f54c0160102ccbebba421b89f3c3af6404d # v3.98.1
+      - uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
         with:
           # The action runs this image tag; the digest pins it like the SHA above.
           version: 3.98.1@sha256:7f1763b872981561538f5d67a4c8247144729dda8110dee83d60b942cd138432
@@ -126,7 +126,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
           version: v2.18.2
