@@ -60,12 +60,29 @@ func styleLevel(l ct.Level, s string) string {
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
+	if !m.opts.NoMouse {
+		// Cell motion reports drags, which is all a selection needs.
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 
+// render is the frame with the mouse selection drawn over it.
 func (m *Model) render() string {
+	lines := m.frame()
+	for y, l := range lines {
+		if from, to, ok := m.sel.span(y, ansi.StringWidth(l)); ok {
+			lines[y] = highlight(l, from, to)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// frame is the screen, one string per row. Row and cell indexes are the mouse's
+// coordinates, which is what lets a selection be read back out of it.
+func (m *Model) frame() []string {
 	if m.width == 0 {
-		return "starting…"
+		return []string{"starting…"}
 	}
 	w := m.boxWidth()
 	parts := []string{"", m.headerView(), ""}
@@ -91,7 +108,7 @@ func (m *Model) render() string {
 			out[i] = margin + l
 		}
 	}
-	return strings.Join(out, "\n")
+	return out
 }
 
 // mainBody is the table (or an empty-state message) plus the filter line when active.
@@ -230,6 +247,11 @@ func (m *Model) statusView() string {
 	if w := m.snap.lastWarning; w.text != "" && m.now().Sub(w.at) < 30*time.Second {
 		left += styleWarn.Render("  ⚠ " + w.text)
 	}
+	// The copy confirmation takes the whole left side: it's short-lived, and
+	// appended it would be the first thing a long status truncates.
+	if m.notice != "" && m.now().Sub(m.noticeAt) < noticeFor {
+		left = styleLive.Render("✓ " + m.notice)
+	}
 
 	right := m.liveStatus()
 	w := m.lineWidth()
@@ -263,7 +285,7 @@ func (m *Model) liveStatus() string {
 }
 
 func (m *Model) helpView() string {
-	keys := "d domain · tab/1-5 switch · / filter · enter details · r search · s source · w live · q quit"
+	keys := "d domain · tab/1-5 switch · / filter · enter details · y copy · r search · s source · w live · q quit"
 	switch {
 	case m.editingDomain:
 		keys = "enter search · esc cancel · ctrl+c quit"
