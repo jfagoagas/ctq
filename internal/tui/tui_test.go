@@ -45,6 +45,10 @@ func newTestModelFor(t *testing.T, domain string) *Model {
 		},
 	})
 	m.now = func() time.Time { return now }
+	// Never the real clipboard of whoever runs the tests. clipboardOf reads it back.
+	copied := new(string)
+	testClipboards.Store(m, copied)
+	m.clipboard = func(s string) error { *copied = s; return nil }
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	return m
 }

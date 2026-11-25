@@ -18,6 +18,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/jfagoagas/ctq/internal/ct"
@@ -43,6 +44,7 @@ type Options struct {
 	Source     string        // auto | crtsh-db | crtsh | certspotter
 	Watch      bool          // start tailing logs immediately
 	CacheTTL   time.Duration // how long a search result is reused; 0 disables the cache
+	NoMouse    bool          // leave the mouse to the terminal: no drag selection, no wheel
 	Backend    Backend
 }
 
@@ -168,6 +170,14 @@ type Model struct {
 	sink    *sink
 	matches chan matchMsg
 	snap    snapshot
+
+	sel         selection
+	lastClick   point // where and when the last click landed, to tell a double click
+	lastClickAt time.Time
+	clicks      int
+	notice      string // "copied …", shown in the status line for noticeFor
+	noticeAt    time.Time
+	clipboard   func(string) error // writes the native clipboard; tests replace it
 }
 
 func New(ctx context.Context, o Options) *Model {
@@ -201,6 +211,7 @@ func New(ctx context.Context, o Options) *Model {
 		cache:      newSearchCache(o.CacheTTL),
 		sink:       newSink(),
 		matches:    make(chan matchMsg, 256),
+		clipboard:  clipboard.WriteAll,
 	}
 }
 
@@ -379,11 +390,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.sel = selection{} // its cells are somewhere else now
 		m.layout()
 		return m, nil
 
 	case tea.KeyPressMsg: // KeyMsg also matches releases
 		return m.handleKey(msg)
+
+	case tea.PasteMsg:
+		return m, m.handlePaste(msg)
+
+	case tea.MouseClickMsg:
+		return m, m.handleClick(msg)
+
+	case tea.MouseMotionMsg:
+		m.handleMotion(msg)
+		return m, nil
+
+	case tea.MouseReleaseMsg:
+		return m, m.handleRelease()
+
+	case tea.MouseWheelMsg:
+		m.handleWheel(msg)
+		return m, nil
 
 	case searchDoneMsg:
 		if msg.gen != m.searchGen {
@@ -438,10 +467,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 	}
-	return m, nil
+	// What's left belongs to the focused input: its cursor blink and the
+	// clipboard text that ctrl+v reads.
+	return m, m.updateInput(msg)
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Any key drops the selection. esc does only that, and ctrl+c copies it
+	// again instead of quitting: with text selected, ctrl+c means copy.
+	if m.sel.active {
+		text := m.selectedText()
+		m.sel = selection{}
+		switch msg.String() {
+		case "esc":
+			return m, nil
+		case "ctrl+c":
+			return m, m.copyText(text)
+		}
+	}
+
 	if m.editingDomain {
 		switch msg.String() {
 		case "ctrl+c":
@@ -526,6 +570,8 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.table.GotoTop()
 			m.applyRows()
 		}
+	case "y":
+		return m, m.copyText(m.rowText())
 	case "d":
 		return m, m.openDomainPrompt()
 	case "r":

@@ -420,6 +420,7 @@ func runTUI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	exact := fs.Bool("exact", false, "only the domain itself, no subdomains")
 	expired := fs.Bool("expired", false, "include expired certificates in history (crt.sh sources only)")
 	noLive := fs.Bool("no-live", false, "don't tail CT logs on start (press w to toggle)")
+	noMouse := fs.Bool("no-mouse", false, "leave the mouse to the terminal: no drag-to-copy, no wheel scrolling")
 	timeout := fs.Duration("timeout", 60*time.Second, "per-request timeout for search")
 	interval := fs.Duration("interval", 15*time.Second, "poll interval per log")
 	workers := fs.Int("workers", 4, "concurrent fetches per log")
@@ -457,6 +458,7 @@ func runTUI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		Source:     *source,
 		Watch:      !*noLive,
 		CacheTTL:   *cacheTTL,
+		NoMouse:    *noMouse,
 		Backend: tui.Backend{
 			Search: func(ctx context.Context, domain, source string, warn io.Writer) ([]ct.Certificate, error) {
 				s, err := newSearcher(source, *timeout, warn)

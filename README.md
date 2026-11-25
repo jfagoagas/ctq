@@ -102,13 +102,22 @@ A log that fails a poll shows as `retrying` and is retried on the next poll. Aft
 | `↑` `↓` | move |
 | `/` | filter the current tab: names, issuers, logs or search events (`esc` clears) |
 | `enter` | show details for the selected row |
+| `y` | copy the selected row in full: its names one per line (History, Live), the name (Names), the log URL (Logs) or the message (Sources) |
 | `o` | change the sort order (Names tab) |
 | `r` | search again |
 | `s` | cycle the search source |
 | `w` | turn the live feed on or off |
 | `q` | quit |
 
-`ctq tui` accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, `-no-live` to start with the live feed off, and `-cache-ttl` (default `15m`) to reuse a search result when switching sources or domains (`r` always searches again, `0` turns the cache off).
+Copy with the mouse: drag to select and the text is copied when you release the button. A double click copies the word under the pointer and a triple click copies the line. Box borders are left out of the copied text. The selection stays highlighted until the next key or click, `esc` clears it, and `ctrl+c` copies it again instead of quitting. The table shortens long cells, so use `y` or the details pane when you need a whole value. The wheel scrolls the table.
+
+Text goes to the clipboard through the OSC 52 terminal sequence, which works over SSH, and through the system clipboard (`pbcopy`, `xclip`, `xsel` or `wl-copy`) for terminals that ignore OSC 52, such as Terminal.app. Inside tmux, OSC 52 needs `set -g set-clipboard on`.
+
+Paste with your terminal's paste shortcut. The text goes to the domain prompt or the filter, whichever is open. With neither open, a paste opens the domain prompt with the text in it.
+
+The TUI captures the mouse for this, so the terminal's own selection needs a modifier: Option in iTerm2 and Terminal.app, Shift in most other terminals. `-no-mouse` gives the mouse back to the terminal and turns off drag-to-copy and wheel scrolling.
+
+`ctq tui` accepts the `search` flags `-source`, `-exact`, `-expired` and `-timeout`, the `watch` flags `-interval`, `-workers` and `-state`, `-no-live` to start with the live feed off, `-no-mouse`, and `-cache-ttl` (default `15m`) to reuse a search result when switching sources or domains (`r` always searches again, `0` turns the cache off).
 
 ## CLI
 
